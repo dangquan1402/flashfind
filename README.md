@@ -19,9 +19,12 @@ live FSEvents updates. That engine is a re-engineering of
 
 > **Status: early, works, tested on Linux and macOS (Apple Silicon).** Code
 > projects mode (discovery, gitignore-aware index, `repo:`/`lang:`/`dirty:`,
-> CLI, MCP) is new in this version. The code index is rebuilt (about 0.1 s per
-> 200 repos), not live-watched yet. There's no content search and no app yet.
-> Not on crates.io.
+> CLI, MCP) follows file changes live (FSEvents, ~30 ms change-to-searchable
+> on a real 323-repo home). There is a small macOS demo app over the C API
+> ([FlashFind.app](#flashfindapp-macos-demo)). No content search yet. Not on
+> crates.io.
+
+![FlashFind.app searching 200 synthetic repos](docs/flashfind-app.png)
 
 ## Credits
 
@@ -101,8 +104,9 @@ model-retry  (~/oss/model-retry, 14d ago)
   `lang:<rust|ts|js|py|go|swift|c|cpp|java|kotlin|ruby|php|cs|zig|lua|sh|md|…>`,
   and `dirty:`. The usual `ext:`, `type:`, `size:`, `mtime:`, `!exclude` and
   `=exact` work too.
-- **Cache:** `~/.cache/flashfind` (`FLASHFIND_CACHE`), rebuilt when older than
-  `--max-age` seconds (default 600) or with `--refresh`.
+- **Live:** the cache (`~/.cache/flashfind`, `FLASHFIND_CACHE`) is a base;
+  changes land in small per-repo overlays (see [Live code index](#live-code-index)).
+  `--refresh` rebuilds from scratch.
 
 ### MCP server (Cursor, Claude Code, …)
 
@@ -115,9 +119,10 @@ model-retry  (~/oss/model-retry, 14d ago)
 | `recent_files` | optional `repo`, `lang`, `within` (`7d`), `limit` | same shape as `find_files`, newest first |
 | `reindex` | – | rediscover and rebuild now |
 
-The index is loaded from the cache (or built) at startup and rebuilt in the
-background when older than `--max-age` (default 300 s). Results list each
-repo root once, with paths relative to it, to keep agent context small.
+The index is loaded from the cache (or built) at startup, caught up with a
+folder-mtime recheck, and then follows FSEvents live, so an agent sees a file
+it just created on its next call. Results list each repo root once, with
+paths relative to it, to keep agent context small.
 
 **Cursor:** add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project):
 
@@ -138,6 +143,59 @@ claude mcp add flashfind -- /absolute/path/to/flashfind mcp --root ~/dev --root 
 ```
 
 Any other MCP client works the same way: the command is `flashfind mcp`.
+
+### Live code index
+
+The code index reuses the whole-disk engine's live machinery, at repo
+granularity:
+
+- **Base + overlays.** The cached index is the base. A change inside a repo
+  re-walks that repo (gitignore-aware, same junk list) into a small overlay
+  index built under the base root, so paths and scores line up, and
+  tombstones the repo's base range. Searches merge base + overlays. Re-walking
+  one repo takes about 5–15 ms; a batch's repos are re-walked in parallel.
+- **What counts as a change.** Events inside junk folders (`node_modules`,
+  `target`, …) are dropped, and so are `.git` internals unless `.git`
+  disappears. Editing `.gitignore` re-walks the repo, so new rules apply at
+  once. An event outside every repo checks that folder and its children for
+  new repos (`git clone`, `git init`) and drops known repos that are gone.
+  Hidden folders, `Library`, `*.noindex`, `__MACOSX` and OrbStack mounts never
+  become projects.
+- **Lost history** (`MustScanSubDirs`, dropped events) inside a repo re-walks
+  it; outside repos it triggers a full rebuild.
+- **Compaction** is a background full rebuild (discover + crawl, ~5 s for
+  323 repos) that swaps in a new base, saves it, and re-applies events that
+  arrived meanwhile. It runs past 64 overlaid repos or every 30 min while
+  overlays exist.
+- **Catch-up on open.** The FSEvents id from before each crawl is saved with
+  the cache, and the watcher (MCP server, app) replays from there in the
+  background. Short-lived processes (`flashfind code`, app launch) first run
+  a parallel **recheck**: stat every indexed folder and treat changed or
+  missing ones as events. A busy home folder produces ~10k FSEvents a minute,
+  so replaying history took ~3.7 s; the recheck takes 70–600 ms depending on
+  load. The recheck sees added, removed and renamed entries, not in-place
+  file edits. The watcher does see those.
+- Elsewhere than macOS the watcher is a periodic rebuild (default 300 s).
+
+Measured on the real home index (323 repos, 235k entries, Apple M5 Pro).
+`flashfind bench-live-code --dir <a folder in an indexed repo>` creates,
+renames and deletes temp files there, waits until each change is searchable,
+then cleans up:
+
+| change → searchable (n=10 each) | p50 | max |
+|---|---|---|
+| create | 29–32 ms | 0.58–0.76 s |
+| rename | 31–33 ms | 0.11–0.17 s |
+| delete | 31 ms | 35 ms |
+| search with overlays present (`readme`) | 0.42–0.49 ms | 1.8–3 ms |
+
+The p50 is FSEvents' 30 ms coalescing latency plus a ~5 ms re-walk. The
+machine had a load average of ~50 from unrelated work during these runs, and
+other repos were changing at the same time (275–287 re-walks per run): the
+max is a change queued behind such a batch. In an earlier run at load ~400,
+p50 rose to 90–120 ms with 5–9 s outliers; that is what led to the parallel
+re-walk. The macOS FSEvents test in `crates/flashfind-code/tests/live.rs`
+measures p50 30 ms, max 44–62 ms on a temp tree.
 
 ### Code benchmark (Apple M5 Pro, synthetic 200-repo home)
 
@@ -264,6 +322,48 @@ Open an index (mmap, ~3 ms for 1.1 M entries) or a live index, create one
 session per search field, and for each keystroke cancel the previous token
 and call `ff_search` on a worker thread. See `crates/flashfind-ffi/examples/smoke.c`.
 
+Code projects: `ff_code_open(roots, cache_dir, &err)` (NULL, NULL = home,
+default cache), `ff_code_watch`, `ff_code_session_new`, then
+`ff_code_search(session, "repo:x lang:rust auth", limit, cancel, cb, ctx, &err)`.
+It delivers hits grouped by repo (`path`, `rel`, `repo`, `repo_root`,
+`group`, `repo_active`, …). Also `ff_code_projects_json`, `ff_code_get_stats`
+and `ff_code_checkpoint`.
+
+## FlashFind.app (macOS demo)
+
+A launcher-style SwiftUI + AppKit app (macOS 15+) in `apps/macos`. It links
+the Rust core **in-process** as a static library through the C ABI: no helper
+process, no socket.
+
+```sh
+scripts/build-app.sh          # cargo build + swift build → dist/FlashFind.app (ad-hoc signed)
+open dist/FlashFind.app
+```
+
+- Menu-bar item (no Dock icon). **⌃⌥Space** shows or hides the window from
+  anywhere (Carbon hot key, no Accessibility permission needed).
+- Searches on every keystroke. Each keystroke cancels the previous search's
+  token, and the search runs on a worker queue. The status line shows engine
+  time and keystroke→results time (typically 1–3 ms and 2.5–5 ms on the real
+  323-repo index).
+- **Code** mode groups results by repo (most recently active first) and
+  takes `repo:` / `lang:` / `dirty:`. **Disk** mode uses a saved whole-disk
+  index at `~/.flashfind/index.ffx` if there is one, and otherwise explains
+  how to build it (that needs Full Disk Access).
+- ↑/↓ select · ↩ open · ⌘↩ reveal in Finder · ⌥↩ open in Cursor (the repo
+  folder plus the file) · ⌘Y, or Space right after ↑/↓, Quick Look · ⌘C copy
+  path (when no query text is selected) · Esc clear / hide · ⌘1 / ⌘2 mode.
+- It shares the CLI/MCP cache (`~/.cache/flashfind`), catches up with a
+  recheck on launch (70–600 ms, or a ~5 s crawl the first time) and follows
+  FSEvents while open.
+- Scriptable for checks: `--query Q`, `--roots A:B`, `--cache DIR`,
+  `--window-id-file F`, `--snapshot PNG`, `--quit-after SECONDS`.
+
+Known gaps: no app icon, no settings UI (the roots come from
+`FLASHFIND_CODE_ROOTS` or `--roots`), no launch-at-login, and the hot key is
+fixed. Space only previews right after arrow-key navigation, because the
+search field needs spaces. The app is ad-hoc signed, not notarized.
+
 ### Reproducing the benchmarks
 
 ```sh
@@ -280,17 +380,18 @@ cargo test --release --workspace
   engine (`search.rs`), live overlay + compaction (`live.rs`), FSEvents /
   polling (`watch.rs`)
 - `crates/flashfind-code`: repo discovery, gitignore-aware code index,
-  `repo:`/`lang:`/`dirty:`, grouping, MCP server (`mcp.rs`)
+  `repo:`/`lang:`/`dirty:`, grouping, live overlays (`live.rs`), MCP server (`mcp.rs`)
 - `crates/flashfind-cli`: the `flashfind` binary
 - `crates/flashfind-ffi`: C ABI
+- `apps/macos`: FlashFind.app (SwiftPM; `scripts/build-app.sh`)
 - `bench/`: run scripts, fsearch baseline harness, results
 
 ## Roadmap
 
-Live-watch the code index (FSEvents + gitignore-aware relisting), let the MCP
-server search file contents in the matched repos, recent-files ranking from
-git history, close the p95 gap on name/typo queries and the multi-word
-slowdown, a Swift demo app over the C API, real-home benchmarks.
+Let the MCP server search file contents in the matched repos, recent-files
+ranking from git history, refresh repo activity on commits without a
+re-walk, close the p95 gap on name/typo queries and the multi-word slowdown,
+app polish (settings, icon, notarization).
 
 ## License
 

@@ -67,3 +67,22 @@ From `cargo test --release -p flashfind-core --test live fsevents -- --nocapture
 the same time (load ~100): create / rename / delete a file and create a new folder in a watched temp
 folder, then poll the search until the change shows up. Event-to-searchable latency over 31 changes:
 **p50 30 ms, max 90 ms** (the FSEvents coalescing latency is set to 30 ms, which accounts for most of it).
+
+## Live code index (real home, 323 repos / 235k entries)
+
+`flashfind bench-live-code --dir ~/dev/flashfind -n 10` (temp files created,
+renamed and deleted in one repo, then cleaned up). Apple M5 Pro, macOS 26.5.1,
+load average ~50 from unrelated work, with other repos changing at the same
+time (275–287 re-walks per run).
+
+| change → searchable | run 1 p50 / max | run 2 p50 / max |
+|---|---|---|
+| create | 31.5 ms / 761 ms | 28.7 ms / 579 ms |
+| rename | 30.8 ms / 169 ms | 32.5 ms / 107 ms |
+| delete | 30.8 ms / 34 ms | 31.0 ms / 35 ms |
+| search `readme` with overlays | 0.49 ms / 1.8 ms | 0.42 ms / 3.1 ms |
+| open + watch + recheck | 300 ms | 69 ms |
+
+Earlier, at load ~400 and with serial re-walks: p50 90–120 ms, max 5–9 s.
+FSEvents test on a temp tree (`cargo test -p flashfind-code --test live
+fsevents`): p50 30 ms, max 44–62 ms over 25 changes.

@@ -322,11 +322,20 @@ impl CodeLive {
             }
             overlays.retain(|o| o.repos.iter().all(|x| &x.path != r));
         }
-        for r in rewalk {
-            let Some(info) = repo_info(r) else { continue };
-            let mut root = snap.base.root.clone();
-            while !r.starts_with(&root) && root.pop() {}
-            let ci = Arc::new(CodeIndex::build_repos_at(&self.cfg, vec![info], &root, 0.0));
+        // Re-walk changed repos in parallel: one busy batch (a branch switch
+        // in a big repo, agents editing several worktrees) must not queue
+        // every other change behind it.
+        use rayon::prelude::*;
+        let built: Vec<(&PathBuf, Arc<CodeIndex>)> = rewalk
+            .par_iter()
+            .filter_map(|r| {
+                let info = repo_info(r)?;
+                let mut root = snap.base.root.clone();
+                while !r.starts_with(&root) && root.pop() {}
+                Some((r, Arc::new(CodeIndex::build_repos_at(&self.cfg, vec![info], &root, 0.0))))
+            })
+            .collect();
+        for (r, ci) in built {
             walked += 1;
             let was_known = snap.known(r);
             if let Some(i) = base_idx(r) {

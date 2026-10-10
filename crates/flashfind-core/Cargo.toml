@@ -1,0 +1,13 @@
+[package]
+name = "flashfind-core"
+description = "Whole-disk file name index and search engine (library)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rayon = { workspace = true }
+memchr = { workspace = true }
+memmap2 = { workspace = true }
+libc = { workspace = true }

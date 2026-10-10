@@ -1,0 +1,18 @@
+[package]
+name = "flashfind-cli"
+description = "flashfind command line: index, search, bench, synthetic tree generator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "flashfind"
+path = "src/main.rs"
+
+[dependencies]
+flashfind-core = { path = "../flashfind-core" }
+rayon = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

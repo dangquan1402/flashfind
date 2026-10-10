@@ -146,7 +146,7 @@ typedef struct {
 ff_code *ff_code_open(const char *roots, const char *cache_dir, char **err);
 int32_t ff_code_watch(const ff_code *c, char **err);   /* FSEvents on macOS */
 void ff_code_unwatch(const ff_code *c);
-void ff_code_stats(const ff_code *c, ff_code_stats *out);
+void ff_code_get_stats(const ff_code *c, ff_code_stats *out);
 char *ff_code_projects_json(const ff_code *c, const char *filter, uint32_t limit); /* ff_string_free */
 void ff_code_checkpoint(const ff_code *c);
 void ff_code_free(ff_code *c);

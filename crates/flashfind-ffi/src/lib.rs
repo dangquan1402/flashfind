@@ -547,7 +547,7 @@ pub unsafe extern "C" fn ff_code_unwatch(c: *const FfCode) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ff_code_stats(c: *const FfCode, out: *mut FfCodeStats) {
+pub unsafe extern "C" fn ff_code_get_stats(c: *const FfCode, out: *mut FfCodeStats) {
     let (Some(c), Some(out)) = (unsafe { c.as_ref() }, unsafe { out.as_mut() }) else {
         return;
     };

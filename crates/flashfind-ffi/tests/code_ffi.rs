@@ -33,7 +33,7 @@ fn code_api_round_trip() {
         let c = ff_code_open(roots.as_ptr(), cache.as_ptr(), &mut err);
         assert!(!c.is_null());
         let mut st = FfCodeStats::default();
-        ff_code_stats(c, &mut st);
+        ff_code_get_stats(c, &mut st);
         assert_eq!(st.repos, 2);
         let s = ff_code_session_new(c);
         let tok = ff_cancel_new();

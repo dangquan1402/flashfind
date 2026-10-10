@@ -1,0 +1,5 @@
+module CFlashFind [system] {
+    header "../../../../crates/flashfind-ffi/include/flashfind.h"
+    link "flashfind"
+    export *
+}

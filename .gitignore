@@ -2,3 +2,5 @@
 /bench/fsearch-baseline/target
 /bench/out
 *.ffx
+/dist/
+apps/macos/.build/

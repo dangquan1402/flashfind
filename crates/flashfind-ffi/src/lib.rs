@@ -55,11 +55,7 @@ fn set_err(err: *mut *mut c_char, msg: &str) {
 }
 
 unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
-    if p.is_null() {
-        None
-    } else {
-        unsafe { CStr::from_ptr(p) }.to_str().ok()
-    }
+    if p.is_null() { None } else { unsafe { CStr::from_ptr(p) }.to_str().ok() }
 }
 
 #[unsafe(no_mangle)]
@@ -85,11 +81,7 @@ pub unsafe extern "C" fn ff_index_open(path: *const c_char, err: *mut *mut c_cha
 
 /// Crawl `root` and build an index in memory (blocking).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ff_index_build(
-    root: *const c_char,
-    threads: u32,
-    err: *mut *mut c_char,
-) -> *mut FfIndex {
+pub unsafe extern "C" fn ff_index_build(root: *const c_char, threads: u32, err: *mut *mut c_char) -> *mut FfIndex {
     let Some(r) = (unsafe { cstr(root) }) else {
         set_err(err, "root is NULL or not UTF-8");
         return std::ptr::null_mut();
@@ -103,11 +95,7 @@ pub unsafe extern "C" fn ff_index_build(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ff_index_save(
-    idx: *const FfIndex,
-    path: *const c_char,
-    err: *mut *mut c_char,
-) -> i32 {
+pub unsafe extern "C" fn ff_index_save(idx: *const FfIndex, path: *const c_char, err: *mut *mut c_char) -> i32 {
     let (Some(i), Some(p)) = (unsafe { idx.as_ref() }, unsafe { cstr(path) }) else {
         set_err(err, "NULL argument");
         return FF_ERROR;
@@ -202,9 +190,7 @@ pub unsafe extern "C" fn ff_search(
     if limit > 0 {
         q.limit = limit as usize;
     }
-    let token = unsafe { cancel.as_ref() }
-        .map(|c| c.0.clone())
-        .unwrap_or_default();
+    let token = unsafe { cancel.as_ref() }.map(|c| c.0.clone()).unwrap_or_default();
     let mut guard = sess.0.lock().unwrap_or_else(|p| p.into_inner());
     let res = match guard.search(&q, &token) {
         Ok(r) => r,
@@ -268,11 +254,7 @@ mod tests {
         let p = unsafe { &*page };
         for i in 0..p.count {
             let h = unsafe { &*p.hits.add(i) };
-            out.push(
-                unsafe { CStr::from_ptr(h.path) }
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            out.push(unsafe { CStr::from_ptr(h.path) }.to_string_lossy().into_owned());
         }
     }
 
@@ -297,45 +279,18 @@ mod tests {
             let c = ff_cancel_new();
             let mut out: Vec<String> = Vec::new();
             let q = CString::new("invoce").unwrap();
-            let rc = ff_search(
-                s,
-                q.as_ptr(),
-                10,
-                c,
-                Some(collect),
-                &mut out as *mut _ as *mut c_void,
-                &mut err,
-            );
+            let rc = ff_search(s, q.as_ptr(), 10, c, Some(collect), &mut out as *mut _ as *mut c_void, &mut err);
             assert_eq!(rc, FF_OK);
             assert!(out[0].ends_with("docs/invoice_2024.pdf"), "{out:?}");
             // Cancelled before start: no callback.
             ff_cancel_cancel(c);
             out.clear();
-            let rc = ff_search(
-                s,
-                q.as_ptr(),
-                10,
-                c,
-                Some(collect),
-                &mut out as *mut _ as *mut c_void,
-                &mut err,
-            );
+            let rc = ff_search(s, q.as_ptr(), 10, c, Some(collect), &mut out as *mut _ as *mut c_void, &mut err);
             assert_eq!(rc, FF_CANCELLED);
             assert!(out.is_empty());
             // Bad query reports an error string.
             let bad = CString::new("size:12zz").unwrap();
-            assert_eq!(
-                ff_search(
-                    s,
-                    bad.as_ptr(),
-                    0,
-                    std::ptr::null(),
-                    None,
-                    std::ptr::null_mut(),
-                    &mut err
-                ),
-                FF_ERROR
-            );
+            assert_eq!(ff_search(s, bad.as_ptr(), 0, std::ptr::null(), None, std::ptr::null_mut(), &mut err), FF_ERROR);
             assert!(!err.is_null());
             ff_string_free(err);
             ff_cancel_free(c);

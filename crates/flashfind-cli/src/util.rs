@@ -18,11 +18,7 @@ pub fn peak_rss() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     let v = ru.ru_maxrss as u64;
-    if cfg!(target_os = "macos") {
-        v
-    } else {
-        v * 1024
-    }
+    if cfg!(target_os = "macos") { v } else { v * 1024 }
 }
 
 pub fn percentile(sorted: &[f64], p: f64) -> f64 {

@@ -27,8 +27,7 @@ fn touch(root: &Path, rel: &str, size: u64, mtime: Option<i64>) {
     let f = std::fs::File::create(&p).unwrap();
     f.set_len(size).unwrap();
     if let Some(t) = mtime {
-        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t as u64))
-            .unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t as u64)).unwrap();
     }
 }
 
@@ -37,13 +36,7 @@ fn disk_index(tag: &str, files: &[(&str, u64, Option<i64>)]) -> (PathBuf, Index)
     for (rel, size, mt) in files {
         touch(&root, rel, *size, *mt);
     }
-    let idx = build_from_disk(
-        &root,
-        &ScanOptions {
-            threads: 4,
-            skip: vec![],
-        },
-    );
+    let idx = build_from_disk(&root, &ScanOptions { threads: 4, skip: vec![] });
     (root, idx)
 }
 
@@ -70,12 +63,10 @@ fn finds_and_ranks_bands() {
     assert_eq!(r[1], "docs/report.pdf");
     assert_eq!(r[2], "docs/reports-2024.xlsx");
     assert_eq!(r[3], "docs/q3-report-final.doc");
-    assert!(
-        r.contains(&"misc/rxexpxoxrxt.bin".to_string()),
-        "fuzzy subsequence match"
-    );
-    // "rport" is one edit from "report": a typo match, ranked last.
-    assert_eq!(r.last().map(String::as_str), Some("docs/airportcodes.txt"));
+    assert!(r.contains(&"misc/rxexpxoxrxt.bin".to_string()), "fuzzy subsequence match");
+    // "rport" is one edit from "report" (typo match); a subsequence scattered
+    // over six gaps ranks below it.
+    assert_eq!(&r[4..], ["docs/airportcodes.txt", "misc/rxexpxoxrxt.bin"]);
 }
 
 #[test]
@@ -95,22 +86,9 @@ fn location_prior() {
 
 #[test]
 fn typo_tolerance_beats_fsearch_rules() {
-    let (_root, idx) = disk_index(
-        "typo",
-        &[("src/flashfind.rs", 1, None), ("src/other.rs", 1, None)],
-    );
-    for t in [
-        "flashfnid",
-        "lfashfind",
-        "glashfind",
-        "flasfind",
-        "flashffind",
-    ] {
-        assert_eq!(
-            top(&idx, t).first().map(String::as_str),
-            Some("src/flashfind.rs"),
-            "{t}"
-        );
+    let (_root, idx) = disk_index("typo", &[("src/flashfind.rs", 1, None), ("src/other.rs", 1, None)]);
+    for t in ["flashfnid", "lfashfind", "glashfind", "flasfind", "flashffind"] {
+        assert_eq!(top(&idx, t).first().map(String::as_str), Some("src/flashfind.rs"), "{t}");
     }
 }
 
@@ -129,10 +107,7 @@ fn multi_token_matches_ancestors() {
     assert_eq!(r[0], "projects/alpha_notes.md");
     assert!(r.contains(&"projects/alpha/notes.md".to_string()));
     // Exact stem under a matching folder beats a word match in a longer name.
-    assert_eq!(
-        top(&idx, "projects/notes"),
-        vec!["projects/alpha/notes.md", "projects/alpha_notes.md"]
-    );
+    assert_eq!(top(&idx, "projects/notes"), vec!["projects/alpha/notes.md", "projects/alpha_notes.md"]);
 }
 
 #[test]
@@ -156,10 +131,7 @@ fn filters() {
     assert_eq!(top(&idx, "photo mtime:<30d type:file").len(), 2);
     assert_eq!(top(&idx, "photo mtime:>1y"), vec!["a/photo.png"]);
     assert_eq!(top(&idx, "photo mtime:>140y").len(), 0);
-    let scope = format!(
-        "photo in:{}/b",
-        std::fs::canonicalize(&root).unwrap().display()
-    );
+    let scope = format!("photo in:{}/b", std::fs::canonicalize(&root).unwrap().display());
     assert_eq!(top(&idx, &scope).len(), 2);
     assert_eq!(top(&idx, "photo !pdf !png !photos"), vec!["a/photo.jpg"]);
     // Filter-only query: entry scan.
@@ -192,12 +164,7 @@ fn deep_paths_are_not_truncated() {
     assert_eq!(idx.depth(r.hits[0].entry), 301);
     assert!(p.ends_with("/d9/deepest_target.txt"));
     assert_eq!(
-        p.matches('/').count()
-            - std::fs::canonicalize(&root)
-                .unwrap()
-                .to_string_lossy()
-                .matches('/')
-                .count(),
+        p.matches('/').count() - std::fs::canonicalize(&root).unwrap().to_string_lossy().matches('/').count(),
         301
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -212,9 +179,7 @@ fn save_load_roundtrip() {
     assert_eq!((back.n, back.u, back.d), (idx.n, idx.u, idx.d));
     assert_eq!(top(&back, "beta"), top(&idx, "beta"));
     assert_eq!(back.lookup(back.root()), Some(0));
-    let e = back
-        .lookup(format!("{}/x/alpha.txt", String::from_utf8_lossy(back.root())).as_bytes())
-        .unwrap();
+    let e = back.lookup(format!("{}/x/alpha.txt", String::from_utf8_lossy(back.root())).as_bytes()).unwrap();
     assert_eq!(back.rel_path(e), "x/alpha.txt");
     std::fs::write(root.join("bad.ffx"), b"nope").unwrap();
     assert!(Index::load(&root.join("bad.ffx")).is_err());
@@ -246,9 +211,7 @@ impl Rng {
 
 fn synthetic(n: usize, seed: u64) -> Index {
     let mut r = Rng(seed);
-    let syll = [
-        "ab", "ca", "de", "fo", "ri", "tu", "na", "le", "mo", "pi", "s", "x", "_", "-", ".", "q",
-    ];
+    let syll = ["ab", "ca", "de", "fo", "ri", "tu", "na", "le", "mo", "pi", "s", "x", "_", "-", ".", "q"];
     let word = |r: &mut Rng| -> Vec<u8> {
         let k = 1 + r.below(5);
         let mut w = Vec::new();
@@ -260,10 +223,7 @@ fn synthetic(n: usize, seed: u64) -> Index {
         }
         w
     };
-    let mut ls: Vec<Listing> = vec![Listing {
-        id: 0,
-        ..Default::default()
-    }];
+    let mut ls: Vec<Listing> = vec![Listing { id: 0, ..Default::default() }];
     let mut count = 0;
     while count < n {
         let li = r.below(ls.len());
@@ -340,10 +300,7 @@ fn shortcuts_equal_reference() {
             }
         }
     }
-    assert!(
-        prefix_used >= 5,
-        "prefix shortcut should trigger on most short queries ({prefix_used})"
-    );
+    assert!(prefix_used >= 5, "prefix shortcut should trigger on most short queries ({prefix_used})");
 }
 
 #[test]
@@ -352,24 +309,11 @@ fn narrowing_equals_reference() {
     let c = CancelToken::new();
     let mut sess = Session::new(idx.clone());
     let mut narrowed = 0;
-    for target in [
-        "abcadefo",
-        "rituna_le",
-        "mopi.txt",
-        "deca rituna",
-        "fole ext:md",
-        "tunale !ca",
-    ] {
+    for target in ["abcadefo", "rituna_le", "mopi.txt", "deca rituna", "fole ext:md", "tunale !ca"] {
         // Type it one char at a time, then delete back.
         let chars: Vec<char> = target.chars().collect();
-        let mut seq: Vec<String> = (1..=chars.len())
-            .map(|i| chars[..i].iter().collect())
-            .collect();
-        seq.extend(
-            (1..chars.len())
-                .rev()
-                .map(|i| chars[..i].iter().collect::<String>()),
-        );
+        let mut seq: Vec<String> = (1..=chars.len()).map(|i| chars[..i].iter().collect()).collect();
+        seq.extend((1..chars.len()).rev().map(|i| chars[..i].iter().collect::<String>()));
         for s in seq {
             let a = sess.search(&q(&s), &c).unwrap();
             let b = search_reference(&idx, &q(&s), &c).unwrap();
@@ -382,22 +326,12 @@ fn narrowing_equals_reference() {
             narrowed += matches!(a.strategy, Strategy::Narrowed | Strategy::Cached) as usize;
         }
     }
-    assert!(
-        narrowed > 20,
-        "narrowing should kick in while typing ({narrowed})"
-    );
+    assert!(narrowed > 20, "narrowing should kick in while typing ({narrowed})");
 }
 
 #[test]
 fn portable_and_native_crawlers_agree() {
-    let (root, idx) = disk_index(
-        "crawl",
-        &[
-            ("a/b/c.txt", 5, None),
-            ("a/d.txt", 1, None),
-            (".hidden/x", 1, None),
-        ],
-    );
+    let (root, idx) = disk_index("crawl", &[("a/b/c.txt", 5, None), ("a/d.txt", 1, None), (".hidden/x", 1, None)]);
     let root = std::fs::canonicalize(root).unwrap();
     let ls = walk::scan_portable(&root, &ScanOptions::default());
     let idx2 = Index::build(ls, &root, 0);

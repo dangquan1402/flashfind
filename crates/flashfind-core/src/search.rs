@@ -14,7 +14,7 @@
 //! * **Cancellation** – every phase polls a [`CancelToken`] between chunks.
 
 use crate::index::Index;
-use crate::matcher::{MAX_NON_PREFIX, TYPO1, may_match};
+use crate::matcher::{MAX_NON_PREFIX, TYPO_MAX, may_match};
 use crate::query::{Mode, Query, Token};
 use crate::walk::{KIND_MASK, NONE};
 use rayon::prelude::*;
@@ -128,12 +128,7 @@ struct NameKey {
 impl NameKey {
     fn of(q: &Query) -> Self {
         NameKey {
-            toks: q
-                .tokens
-                .iter()
-                .take(MAX_TOKENS)
-                .map(|t| (t.mode, t.pat.text.clone(), t.pat.typos))
-                .collect(),
+            toks: q.tokens.iter().take(MAX_TOKENS).map(|t| (t.mode, t.pat.text.clone(), t.pat.typos)).collect(),
             negs: q.negs.clone(),
             exts: q.exts.clone(),
         }
@@ -158,9 +153,7 @@ impl NameKey {
                 return false;
             }
         }
-        prev.negs.iter().all(|n| self.negs.contains(n))
-            && (prev.exts.is_empty()
-                || (!self.exts.is_empty() && self.exts.iter().all(|e| prev.exts.contains(e))))
+        prev.negs.iter().all(|n| self.negs.contains(n)) && (prev.exts.is_empty() || (!self.exts.is_empty() && self.exts.iter().all(|e| prev.exts.contains(e))))
     }
 }
 
@@ -266,11 +259,7 @@ impl Ctx<'_> {
             return None;
         }
         if toks.is_empty() {
-            return Some(Row {
-                id,
-                score: 0,
-                bits: 0,
-            });
+            return Some(Row { id, score: 0, bits: 0 });
         }
         let orig = self.idx.orig(id);
         let sig = self.idx.sig(id);
@@ -349,9 +338,7 @@ impl Ctx<'_> {
                 if self.cancel.is_cancelled() {
                     return Vec::new();
                 }
-                ch.iter()
-                    .filter_map(|r| self.score_name(r.id, masks[r.id as usize]))
-                    .collect()
+                ch.iter().filter_map(|r| self.score_name(r.id, masks[r.id as usize])).collect()
             })
             .collect();
         self.check()?;
@@ -360,44 +347,21 @@ impl Ctx<'_> {
 
     #[inline]
     fn check(&self) -> Result<(), Cancelled> {
-        if self.cancel.is_cancelled() {
-            Err(Cancelled)
-        } else {
-            Ok(())
-        }
+        if self.cancel.is_cancelled() { Err(Cancelled) } else { Ok(()) }
     }
 
     #[inline]
     fn entry_ok(&self, e: usize, kinds: &[u8], sizes: &[u64], mtimes: &[i64]) -> bool {
         let q = self.q;
-        (1u8 << (kinds[e] & KIND_MASK)) & q.kinds != 0
-            && sizes[e] >= q.size.0
-            && sizes[e] <= q.size.1
-            && mtimes[e] >= q.mtime.0
-            && mtimes[e] <= q.mtime.1
+        (1u8 << (kinds[e] & KIND_MASK)) & q.kinds != 0 && sizes[e] >= q.size.0 && sizes[e] <= q.size.1 && mtimes[e] >= q.mtime.0 && mtimes[e] <= q.mtime.1
     }
 
     /// Expand name rows to entries and keep the top `limit`.
-    fn entries(
-        &self,
-        rows: &[Row],
-        range: (u32, u32),
-        anc: Option<&[u8]>,
-    ) -> Result<(Vec<Hit>, u64), Cancelled> {
+    fn entries(&self, rows: &[Row], range: (u32, u32), anc: Option<&[u8]>) -> Result<(Vec<Hit>, u64), Cancelled> {
         let idx = self.idx;
-        let (kinds, sizes, mtimes, prior, parent) = (
-            idx.ent_kind(),
-            idx.ent_size(),
-            idx.ent_mtime(),
-            idx.ent_prior(),
-            idx.ent_parent(),
-        );
+        let (kinds, sizes, mtimes, prior, parent) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime(), idx.ent_prior(), idx.ent_parent());
         let ntok = self.toks.len().min(MAX_TOKENS);
-        let all: u8 = if ntok == 0 {
-            0
-        } else {
-            ((1u16 << ntok) - 1) as u8
-        };
+        let all: u8 = if ntok == 0 { 0 } else { ((1u16 << ntok) - 1) as u8 };
         let full_range = range == (0, idx.n as u32);
         let limit = self.q.limit.max(1);
         // Chunk rows so each work item expands roughly ENTRY_CHUNK entries.
@@ -460,9 +424,7 @@ impl Ctx<'_> {
 
     fn no_entry_filters(&self) -> bool {
         let q = self.q;
-        q.kinds == crate::query::KINDS_ALL
-            && q.size == (0, u64::MAX)
-            && q.mtime == (i64::MIN, i64::MAX)
+        q.kinds == crate::query::KINDS_ALL && q.size == (0, u64::MAX) && q.mtime == (i64::MIN, i64::MAX)
     }
 
     fn count_in_range(&self, id: u32, range: (u32, u32)) -> u64 {
@@ -476,19 +438,9 @@ impl Ctx<'_> {
     /// Single-token rows sorted by score (desc): expand sequentially and stop
     /// as soon as the best remaining name cannot reach the current k-th hit.
     /// Returns (hits, entries seen, stopped early).
-    fn entries_ranked(
-        &self,
-        rows: &[Row],
-        range: (u32, u32),
-        limit: usize,
-    ) -> Result<(Vec<Hit>, u64, bool), Cancelled> {
+    fn entries_ranked(&self, rows: &[Row], range: (u32, u32), limit: usize) -> Result<(Vec<Hit>, u64, bool), Cancelled> {
         let idx = self.idx;
-        let (kinds, sizes, mtimes, prior) = (
-            idx.ent_kind(),
-            idx.ent_size(),
-            idx.ent_mtime(),
-            idx.ent_prior(),
-        );
+        let (kinds, sizes, mtimes, prior) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime(), idx.ent_prior());
         let full_range = range == (0, idx.n as u32);
         let mut tk = TopK::new(limit);
         // Wave 1 (sequential): best rows until the page is full.
@@ -552,12 +504,7 @@ impl Ctx<'_> {
 
     fn entry_scan(&self, range: (u32, u32)) -> Result<(Vec<Hit>, u64), Cancelled> {
         let idx = self.idx;
-        let (kinds, sizes, mtimes, prior) = (
-            idx.ent_kind(),
-            idx.ent_size(),
-            idx.ent_mtime(),
-            idx.ent_prior(),
-        );
+        let (kinds, sizes, mtimes, prior) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime(), idx.ent_prior());
         let limit = self.q.limit.max(1);
         let lo = range.0.max(1) as usize;
         let hi = range.1 as usize;
@@ -583,9 +530,37 @@ impl Ctx<'_> {
 }
 
 fn has_ext(lower: &[u8], exts: &[Vec<u8>]) -> bool {
-    exts.iter().any(|e| {
-        lower.len() > e.len() && lower.ends_with(e) && lower[lower.len() - e.len() - 1] == b'.'
-    })
+    exts.iter()
+        .any(|e| lower.len() > e.len() && lower.ends_with(e) && lower[lower.len() - e.len() - 1] == b'.')
+}
+
+/// Rows by score descending, then name id: counting sort (scores in the
+/// prefix bands take few distinct values).
+fn sort_rows_desc(mut rows: Vec<Row>) -> Vec<Row> {
+    let (Some(lo), Some(hi)) = (rows.iter().map(|r| r.score).min(), rows.iter().map(|r| r.score).max()) else {
+        return rows;
+    };
+    let span = (hi - lo) as usize + 1;
+    if span > 4096 || rows.len() < 64 {
+        rows.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.id.cmp(&b.id)));
+        return rows;
+    }
+    let mut count = vec![0usize; span + 1];
+    for r in &rows {
+        count[(hi - r.score) as usize + 1] += 1;
+    }
+    for i in 0..span {
+        count[i + 1] += count[i];
+    }
+    let mut out = vec![Row { id: 0, score: 0, bits: 0 }; rows.len()];
+    // Stable: equal scores keep name order (ties are broken per entry later).
+    for r in &rows {
+        let slot = &mut count[(hi - r.score) as usize];
+        out[*slot] = *r;
+        *slot += 1;
+    }
+    rows.clear();
+    out
 }
 
 /// Contiguous range of `name_sorted` whose names start with `t`.
@@ -596,13 +571,7 @@ pub fn prefix_range(idx: &Index, t: &[u8]) -> std::ops::Range<usize> {
     lo..lo + len
 }
 
-fn run(
-    idx: &Index,
-    q: &Query,
-    mut cache: Option<&mut Vec<Survivors>>,
-    cancel: &CancelToken,
-    shortcuts: bool,
-) -> Result<SearchResult, Cancelled> {
+fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &CancelToken, shortcuts: bool) -> Result<SearchResult, Cancelled> {
     if cancel.is_cancelled() {
         return Err(Cancelled);
     }
@@ -614,11 +583,7 @@ fn run(
         },
     };
     let toks = &q.tokens[..q.tokens.len().min(MAX_TOKENS)];
-    let negs = q
-        .negs
-        .iter()
-        .map(|n| memchr::memmem::Finder::new(n))
-        .collect();
+    let negs = q.negs.iter().map(|n| memchr::memmem::Finder::new(n)).collect();
     let mut ctx = Ctx {
         idx,
         q,
@@ -645,31 +610,39 @@ fn run(
     // contiguous slice of `name_sorted`; score them, expand in score order and
     // stop once no remaining name can enter the page. If the page's k-th hit
     // beats every possible non-prefix match, it is the exact answer.
-    if shortcuts
-        && toks.len() == 1
-        && toks[0].mode != Mode::Suffix
-        && toks[0].mode != Mode::Substring
-    {
+    if shortcuts && toks.len() == 1 && toks[0].mode != Mode::Suffix && toks[0].mode != Mode::Substring {
         let t = &toks[0];
         let complete = matches!(t.mode, Mode::Prefix | Mode::Exact);
         let t0 = std::time::Instant::now();
         let r = prefix_range(idx, &t.pat.text);
-        let ids = &idx.name_sorted()[r];
-        let masks = idx.name_mask();
-        let mut rows: Vec<Row> = if ids.len() > 32 * 1024 {
-            ids.par_iter()
-                .filter_map(|&id| ctx.score_name(id, masks[id as usize]))
-                .collect()
+        let ids = &idx.name_sorted()[r.clone()];
+        let rows: Vec<Row> = if q.exts.is_empty() && q.negs.is_empty() {
+            // Fast path: every name in the range is an exact/stem/prefix
+            // match whose score depends only on its length and stem length,
+            // read sequentially from the sorted-order side arrays.
+            let (lens, stems) = (&idx.sorted_len()[r.clone()], &idx.sorted_stem()[r]);
+            let m = t.pat.text.len();
+            let exact_only = t.mode == Mode::Exact;
+            let mut rows = Vec::with_capacity(ids.len());
+            for i in 0..ids.len() {
+                let (n, st) = (lens[i] as usize, stems[i] as usize);
+                let score = if n == m {
+                    crate::matcher::EXACT
+                } else if exact_only {
+                    continue;
+                } else if t.mode == Mode::Fuzzy && st == m {
+                    crate::matcher::STEM - ((n - m - 1) as i32).min(10)
+                } else {
+                    crate::matcher::PREFIX - crate::matcher::prefix_pen(n - m)
+                };
+                rows.push(Row { id: ids[i], score, bits: 1 });
+            }
+            rows
         } else {
-            ids.iter()
-                .filter_map(|&id| ctx.score_name(id, masks[id as usize]))
-                .collect()
+            let masks = idx.name_mask();
+            ids.iter().filter_map(|&id| ctx.score_name(id, masks[id as usize])).collect()
         };
-        if rows.len() > 32 * 1024 {
-            rows.par_sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.id.cmp(&b.id)));
-        } else {
-            rows.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.id.cmp(&b.id)));
-        }
+        let rows = sort_rows_desc(rows);
         let name_us = t0.elapsed().as_micros() as u32;
         let t1 = std::time::Instant::now();
         let limit = q.limit.max(1);
@@ -698,7 +671,7 @@ fn run(
         }
     }
     // --- Clean-first gate: a single 5–8 byte fuzzy token forgives one typo,
-    // but typo matches score at most TYPO1 + 30 (+ prior). If the clean pass
+    // but typo matches score at most TYPO_MAX (+ prior). If the clean pass
     // alone already fills the page above that, typo matching cannot change
     // the page, so it is skipped (total becomes a lower bound).
     if shortcuts && toks.len() == 1 && toks[0].mode == Mode::Fuzzy && toks[0].pat.typos == 1 {
@@ -711,7 +684,7 @@ fn run(
         let t1 = std::time::Instant::now();
         let (hits, total) = ctx.entries(&rows, range, None)?;
         let limit = q.limit.max(1);
-        if hits.len() >= limit && hits[limit - 1].score > TYPO1 + 30 + MAX_PRIOR {
+        if hits.len() >= limit && hits[limit - 1].score > TYPO_MAX + MAX_PRIOR {
             return Ok(SearchResult {
                 hits,
                 total,
@@ -732,7 +705,13 @@ fn run(
     let name_us = t0.elapsed().as_micros() as u32;
     let t1 = std::time::Instant::now();
     let anc = (toks.len() > 1).then(|| ctx.ancestors(&rows));
-    let (hits, total) = ctx.entries(&rows, range, anc.as_deref())?;
+    let pruned: Option<Vec<Row>> = anc.as_ref().map(|a| {
+        // A token no folder name matches must be matched by the name itself.
+        let any_dir = a.iter().fold(0u8, |m, &b| m | b);
+        let all: u8 = ((1u16 << toks.len()) - 1) as u8;
+        rows.iter().copied().filter(|r| (all & !r.bits) & !any_dir == 0).collect()
+    });
+    let (hits, total) = ctx.entries(pruned.as_deref().unwrap_or(&rows), range, anc.as_deref())?;
     Ok(SearchResult {
         hits,
         total,
@@ -745,11 +724,7 @@ fn run(
     })
 }
 
-fn name_phase(
-    ctx: &Ctx,
-    key: NameKey,
-    cache: Option<&mut Vec<Survivors>>,
-) -> Result<(Arc<Vec<Row>>, Strategy, usize), Cancelled> {
+fn name_phase(ctx: &Ctx, key: NameKey, cache: Option<&mut Vec<Survivors>>) -> Result<(Arc<Vec<Row>>, Strategy, usize), Cancelled> {
     let idx = ctx.idx;
     let mut strategy = Strategy::Full;
     let mut rows: Option<Arc<Vec<Row>>> = None;
@@ -773,10 +748,7 @@ fn name_phase(
         && strategy != Strategy::Cached
     {
         c.retain(|s| s.key != key);
-        c.push(Survivors {
-            key,
-            rows: rows.clone(),
-        });
+        c.push(Survivors { key, rows: rows.clone() });
         if c.len() > CACHE {
             c.remove(0);
         }
@@ -791,11 +763,7 @@ pub fn search(idx: &Index, q: &Query, cancel: &CancelToken) -> Result<SearchResu
 
 /// Full scan with every shortcut disabled (reference for tests/benches).
 #[doc(hidden)]
-pub fn search_reference(
-    idx: &Index,
-    q: &Query,
-    cancel: &CancelToken,
-) -> Result<SearchResult, Cancelled> {
+pub fn search_reference(idx: &Index, q: &Query, cancel: &CancelToken) -> Result<SearchResult, Cancelled> {
     run(idx, q, None, cancel, false)
 }
 
@@ -808,10 +776,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(idx: Arc<Index>) -> Session {
-        Session {
-            idx,
-            cache: Vec::new(),
-        }
+        Session { idx, cache: Vec::new() }
     }
     pub fn index(&self) -> &Arc<Index> {
         &self.idx

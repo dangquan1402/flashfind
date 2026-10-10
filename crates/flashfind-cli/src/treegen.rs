@@ -196,15 +196,7 @@ const DIRS: &[&str] = &[
     "team",
     "notes",
 ];
-const NOISE: &[&str] = &[
-    "node_modules",
-    ".git",
-    "build",
-    "Caches",
-    ".cache",
-    "target",
-    "__pycache__",
-];
+const NOISE: &[&str] = &["node_modules", ".git", "build", "Caches", ".cache", "target", "__pycache__"];
 const EXTS: &[(&str, u32)] = &[
     ("txt", 6),
     ("md", 6),
@@ -252,9 +244,7 @@ fn ext(r: &mut Rng) -> &'static str {
 
 fn cap(w: &str) -> String {
     let mut c = w.chars();
-    c.next()
-        .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
-        .unwrap_or_default()
+    c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str()).unwrap_or_default()
 }
 
 fn file_stem(r: &mut Rng) -> String {
@@ -283,10 +273,7 @@ pub const GEN_NOW: i64 = 1_788_000_000;
 pub fn run(o: &GenOpts) -> std::io::Result<()> {
     let t0 = std::time::Instant::now();
     if o.root.exists() && std::fs::read_dir(&o.root)?.next().is_some() {
-        return Err(std::io::Error::other(format!(
-            "{} exists and is not empty; remove it first",
-            o.root.display()
-        )));
+        return Err(std::io::Error::other(format!("{} exists and is not empty; remove it first", o.root.display())));
     }
     std::fs::create_dir_all(&o.root)?;
     let mut r = Rng(o.seed);
@@ -307,11 +294,7 @@ pub fn run(o: &GenOpts) -> std::io::Result<()> {
             0 => NOISE[r.below(NOISE.len())].to_string(),
             1..=8 => DIRS[r.below(DIRS.len())].to_string(),
             9..=14 => WORDS[r.below(WORDS.len())].to_string(),
-            _ => format!(
-                "{}_{}",
-                WORDS[r.below(WORDS.len())],
-                WORDS[r.below(WORDS.len())]
-            ),
+            _ => format!("{}_{}", WORDS[r.below(WORDS.len())], WORDS[r.below(WORDS.len())]),
         };
         let mut n = name.clone();
         let mut k = 2;
@@ -331,11 +314,7 @@ pub fn run(o: &GenOpts) -> std::io::Result<()> {
         } else {
             dpath.push(dpath[*p as usize].join(n));
             let pr = &drel[*p as usize];
-            drel.push(if pr.is_empty() {
-                n.clone()
-            } else {
-                format!("{pr}/{n}")
-            });
+            drel.push(if pr.is_empty() { n.clone() } else { format!("{pr}/{n}") });
         }
     }
     // --- Files.
@@ -360,22 +339,18 @@ pub fn run(o: &GenOpts) -> std::io::Result<()> {
         std::fs::create_dir(p)?;
     }
     let created = std::sync::atomic::AtomicUsize::new(0);
-    files
-        .par_chunks(4096)
-        .try_for_each(|ch| -> std::io::Result<()> {
-            for (d, n, size, mtime) in ch {
-                let f = std::fs::File::create(dpath[*d as usize].join(n))?;
-                f.set_len(*size)?;
-                f.set_modified(
-                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(*mtime as u64),
-                )?;
-            }
-            let c = created.fetch_add(ch.len(), std::sync::atomic::Ordering::Relaxed) + ch.len();
-            if c % (100 * 4096) < 4096 {
-                eprintln!("  {c} files…");
-            }
-            Ok(())
-        })?;
+    files.par_chunks(4096).try_for_each(|ch| -> std::io::Result<()> {
+        for (d, n, size, mtime) in ch {
+            let f = std::fs::File::create(dpath[*d as usize].join(n))?;
+            f.set_len(*size)?;
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(*mtime as u64))?;
+        }
+        let c = created.fetch_add(ch.len(), std::sync::atomic::Ordering::Relaxed) + ch.len();
+        if c % (100 * 4096) < 4096 {
+            eprintln!("  {c} files…");
+        }
+        Ok(())
+    })?;
     let entries = dirs.len() - 1 + files.len();
     eprintln!(
         "generated {} dirs + {} files = {entries} entries in {:.1?}",
@@ -390,9 +365,7 @@ pub fn run(o: &GenOpts) -> std::io::Result<()> {
 
 fn typo(r: &mut Rng, s: &str, kind: &str) -> Option<String> {
     let mut c: Vec<char> = s.chars().collect();
-    let letters: Vec<usize> = (1..c.len())
-        .filter(|&i| c[i].is_ascii_alphabetic())
-        .collect();
+    let letters: Vec<usize> = (1..c.len()).filter(|&i| c[i].is_ascii_alphabetic()).collect();
     if letters.is_empty() {
         return None;
     }
@@ -439,13 +412,7 @@ fn typo(r: &mut Rng, s: &str, kind: &str) -> Option<String> {
     Some(c.into_iter().collect())
 }
 
-fn write_queries(
-    o: &GenOpts,
-    r: &mut Rng,
-    dirs: &[(u32, String, u32)],
-    drel: &[String],
-    files: &[(u32, String, u64, i64)],
-) -> std::io::Result<()> {
+fn write_queries(o: &GenOpts, r: &mut Rng, dirs: &[(u32, String, u32)], drel: &[String], files: &[(u32, String, u64, i64)]) -> std::io::Result<()> {
     let mut count: HashMap<String, u32> = HashMap::new();
     for (_, n, _) in dirs.iter().skip(1) {
         *count.entry(n.to_lowercase()).or_default() += 1;
@@ -484,10 +451,7 @@ fn write_queries(
         })
         .collect();
     if pool.len() < 600 {
-        return Err(std::io::Error::other(format!(
-            "only {} unique targets; generate more files",
-            pool.len()
-        )));
+        return Err(std::io::Error::other(format!("only {} unique targets; generate more files", pool.len())));
     }
     let mut picks: Vec<usize> = Vec::new();
     let mut taken = HashSet::new();
@@ -521,10 +485,7 @@ fn write_queries(
                 "exact" => name.clone(),
                 "stem" => stem.to_string(),
                 "multi" => {
-                    if *d == 0
-                        || dirs[*d as usize].1.contains(' ')
-                        || dirs[*d as usize].1.starts_with('.')
-                    {
+                    if *d == 0 || dirs[*d as usize].1.contains(' ') || dirs[*d as usize].1.starts_with('.') {
                         continue;
                     }
                     format!("{} {stem}", dirs[*d as usize].1)
@@ -562,11 +523,7 @@ fn write_queries(
         let seq: Vec<String> = (1..=stem.len()).map(|k| stem[..k].to_string()).collect();
         emit(json!({"class": "keys", "seq": seq, "expect": rel(*d, name)}))?;
     }
-    eprintln!(
-        "wrote queries to {} ({} targets in pool)",
-        o.queries.display(),
-        pool.len()
-    );
+    eprintln!("wrote queries to {} ({} targets in pool)", o.queries.display(), pool.len());
     let _ = Path::new("");
     Ok(())
 }

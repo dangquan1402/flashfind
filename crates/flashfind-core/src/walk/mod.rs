@@ -75,10 +75,7 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        ScanOptions {
-            threads: 8,
-            skip: Vec::new(),
-        }
+        ScanOptions { threads: 8, skip: Vec::new() }
     }
 }
 
@@ -110,11 +107,7 @@ pub fn scan_portable(root: &Path, opts: &ScanOptions) -> Vec<Listing> {
 
 /// Name of the backend [`scan`] uses.
 pub fn backend() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "getattrlistbulk"
-    } else {
-        "read_dir"
-    }
+    if cfg!(target_os = "macos") { "getattrlistbulk" } else { "read_dir" }
 }
 
 pub(crate) struct Sink {
@@ -130,20 +123,14 @@ impl Sink {
         }
     }
     pub fn push(&self, l: Listing) {
-        let slot = rayon::current_thread_index()
-            .unwrap_or(self.out.len() - 1)
-            .min(self.out.len() - 1);
+        let slot = rayon::current_thread_index().unwrap_or(self.out.len() - 1).min(self.out.len() - 1);
         self.out[slot].lock().unwrap().push(l);
     }
     pub fn id(&self) -> u32 {
-        self.next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
     pub fn finish(self) -> Vec<Listing> {
-        self.out
-            .into_iter()
-            .flat_map(|m| m.into_inner().unwrap())
-            .collect()
+        self.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
     }
 }
 

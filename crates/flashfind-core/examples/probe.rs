@@ -33,9 +33,7 @@ fn main() {
             if !may_match(p.mask, p.typos, masks[id as usize]) {
                 continue;
             }
-            if p.score_sig(idx.lower(id), idx.orig(id), idx.sig(id))
-                .is_some()
-            {
+            if p.score_sig(idx.lower(id), idx.orig(id), idx.sig(id)).is_some() {
                 n += 1;
             }
         }

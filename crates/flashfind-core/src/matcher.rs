@@ -13,7 +13,8 @@
 //! | substring at word start   | 700 − ≤40        |
 //! | substring                 | 600 − ≤60        |
 //! | fuzzy subsequence         | 60 ..= 560       |
-//! | typo (OSA distance 1 / 2) | ≤ 480 / ≤ 360    |
+//! | typo, whole stem (d=1/2)  | 545 / 485        |
+//! | typo, part of name (d=1/2)| ≤ 480 / ≤ 360    |
 //!
 //! Typo tolerance uses a bit-parallel optimal-string-alignment (Damerau)
 //! distance (Hyyrö 2003): a token of 5–8 bytes forgives one edit, 9+ bytes
@@ -88,8 +89,12 @@ pub const PREFIX: i32 = 800;
 pub const WORD: i32 = 700;
 pub const SUBSTR: i32 = 600;
 pub const FUZZY_MAX: i32 = 560;
+/// Whole stem (name minus extension) within budget: `TYPO_STEM − 60·(d−1)`.
+pub const TYPO_STEM: i32 = 545;
 pub const TYPO1: i32 = 450;
 pub const TYPO2: i32 = 330;
+/// Highest score a typo match can get.
+pub const TYPO_MAX: i32 = TYPO_STEM;
 /// Highest score any non-prefix match (word/substring/fuzzy/typo) can get.
 pub const MAX_NON_PREFIX: i32 = WORD - 1;
 
@@ -119,9 +124,7 @@ fn boundary(orig: &[u8], p: usize) -> bool {
         return true;
     }
     let (a, b) = (orig[p - 1], orig[p]);
-    !is_alnum(a)
-        || (a.is_ascii_lowercase() && b.is_ascii_uppercase())
-        || (a.is_ascii_alphabetic() != b.is_ascii_alphabetic() && is_alnum(b))
+    !is_alnum(a) || (a.is_ascii_lowercase() && b.is_ascii_uppercase()) || (a.is_ascii_alphabetic() != b.is_ascii_alphabetic() && is_alnum(b))
 }
 
 /// Precomputed per-token matcher state.
@@ -145,11 +148,7 @@ pub struct Pattern {
 
 impl Pattern {
     pub fn new(folded: &[u8], allow_typos: bool) -> Pattern {
-        let typos = if allow_typos {
-            typo_budget(folded.len())
-        } else {
-            0
-        };
+        let typos = if allow_typos { typo_budget(folded.len()) } else { 0 };
         let peq = (typos > 0).then(|| {
             let mut t = Box::new([0u64; 256]);
             for (i, &c) in folded.iter().enumerate() {
@@ -223,10 +222,7 @@ impl Pattern {
     #[inline]
     pub fn score_sig(&self, name: &[u8], orig: &[u8], name_bigrams: Sig) -> Option<i32> {
         let clean = self.clean_score(name, orig);
-        if clean.is_some_and(|c| c >= TYPO1 + 30)
-            || name.len() + (self.typos as usize) < self.text.len()
-            || !self.typo_candidate(name_bigrams)
-        {
+        if clean.is_some_and(|c| c >= TYPO1 + 30) || name.len() + (self.typos as usize) < self.text.len() || !self.typo_candidate(name_bigrams) {
             return clean;
         }
         match self.typo(name) {
@@ -258,19 +254,26 @@ impl Pattern {
         best
     }
 
-    /// Typo score: OSA distance of the token to the best substring of the
-    /// name, within budget.
+    /// Typo score: OSA distance of the token to the whole stem (best), else
+    /// to the best substring of the name, within budget.
     fn typo(&self, name: &[u8]) -> Option<i32> {
         let peq = self.peq.as_deref()?;
         let m = self.text.len();
-        let d = osa_distance(peq, m, name, false);
+        let (d, _) = osa_distance(peq, m, name, false);
         if d == 0 || d > self.typos as u32 {
             return None;
         }
-        let anchored = osa_distance(peq, m, name, true) == d;
+        let stem_end = match name.iter().rposition(|&b| b == b'.') {
+            Some(p) if p > 0 => p,
+            _ => name.len(),
+        };
+        let (pre, whole) = osa_distance(peq, m, &name[..stem_end], true);
+        if whole <= self.typos as u32 && whole > 0 {
+            return Some(TYPO_STEM - 60 * (whole as i32 - 1) - len_pen(name.len() - stem_end, 10) / 2);
+        }
         let base = if d == 1 { TYPO1 } else { TYPO2 };
         let extra = name.len().saturating_sub(m);
-        Some(base + if anchored { 30 } else { 0 } - len_pen(extra, 40))
+        Some(base + if pre == d { 30 } else { 0 } - len_pen(extra, 40))
     }
 }
 
@@ -338,11 +341,15 @@ pub fn fuzzy(t: &[u8], name: &[u8], orig: &[u8]) -> Option<i32> {
     for i in 1..m {
         let gap = pos[i] as i32 - pos[i - 1] as i32 - 1;
         if gap > 0 {
-            score -= 12 + gap.min(20);
+            score -= 30 + 2 * gap.min(15);
             if boundary(orig, pos[i] as usize) {
-                score += 8;
+                score += 15;
             }
         }
+    }
+    // Match ends at a word end (before a separator, the extension or the end).
+    if end + 1 == name.len() || !is_alnum(name[end + 1]) {
+        score += 10;
     }
     score -= ((name.len() - m) as i32 / 2).min(30);
     Some(score.clamp(60, FUZZY_MAX))
@@ -352,7 +359,10 @@ pub fn fuzzy(t: &[u8], name: &[u8], orig: &[u8]) -> Option<i32> {
 /// distance between pattern (≤ 64 bytes, given as its `peq` table and
 /// length) and the best substring of `text` (`anchored = false`) or the best
 /// prefix of `text` (`anchored = true`). Myers 1999 / Hyyrö 2003.
-pub fn osa_distance(peq: &[u64; 256], m: usize, text: &[u8], anchored: bool) -> u32 {
+///
+/// Returns `(best, last)`: the minimum over all end positions, and the value
+/// at the end of `text` (with `anchored`, that is the global distance).
+pub fn osa_distance(peq: &[u64; 256], m: usize, text: &[u8], anchored: bool) -> (u32, u32) {
     debug_assert!(m >= 1 && m <= 64);
     let full = if m == 64 { u64::MAX } else { (1u64 << m) - 1 };
     let high = 1u64 << (m - 1);
@@ -382,7 +392,7 @@ pub fn osa_distance(peq: &[u64; 256], m: usize, text: &[u8], anchored: bool) -> 
         pm_prev = pm;
         best = best.min(score);
     }
-    best
+    (best, score)
 }
 
 #[cfg(test)]
@@ -402,9 +412,7 @@ mod tests {
         for i in 1..=m {
             for j in 1..=n {
                 let cost = (p[i - 1] != t[j - 1]) as u32;
-                let mut v = (d[i - 1][j] + 1)
-                    .min(d[i][j - 1] + 1)
-                    .min(d[i - 1][j - 1] + cost);
+                let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
                 if i > 1 && j > 1 && p[i - 1] == t[j - 2] && p[i - 2] == t[j - 1] {
                     v = v.min(d[i - 2][j - 2] + 1);
                 }
@@ -412,6 +420,28 @@ mod tests {
             }
         }
         (0..=n).map(|j| d[m][j]).min().unwrap()
+    }
+
+    fn osa_global_ref(p: &[u8], t: &[u8]) -> u32 {
+        let (m, n) = (p.len(), t.len());
+        let mut d = vec![vec![0u32; n + 1]; m + 1];
+        for i in 0..=m {
+            d[i][0] = i as u32;
+        }
+        for j in 0..=n {
+            d[0][j] = j as u32;
+        }
+        for i in 1..=m {
+            for j in 1..=n {
+                let cost = (p[i - 1] != t[j - 1]) as u32;
+                let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+                if i > 1 && j > 1 && p[i - 1] == t[j - 2] && p[i - 2] == t[j - 1] {
+                    v = v.min(d[i - 2][j - 2] + 1);
+                }
+                d[i][j] = v;
+            }
+        }
+        d[m][n]
     }
 
     fn peq(p: &[u8]) -> Box<[u64; 256]> {
@@ -433,9 +463,7 @@ mod tests {
         }
         fn word(&mut self, max: usize) -> Vec<u8> {
             let len = 1 + (self.next() as usize % max);
-            (0..len)
-                .map(|_| b"abcde"[(self.next() % 5) as usize])
-                .collect()
+            (0..len).map(|_| b"abcde"[(self.next() % 5) as usize]).collect()
         }
     }
 
@@ -448,13 +476,14 @@ mod tests {
             let pq = peq(&p);
             for anchored in [false, true] {
                 assert_eq!(
-                    osa_distance(&pq, p.len(), &t, anchored),
+                    osa_distance(&pq, p.len(), &t, anchored).0,
                     osa_ref(&p, &t, anchored),
                     "p={:?} t={:?} anchored={anchored}",
                     String::from_utf8_lossy(&p),
                     String::from_utf8_lossy(&t)
                 );
             }
+            assert_eq!(osa_distance(&pq, p.len(), &t, true).1, osa_global_ref(&p, &t), "global");
         }
     }
 
@@ -463,13 +492,12 @@ mod tests {
         let p: Vec<u8> = (0..64).map(|i| b'a' + (i % 26) as u8).collect();
         let mut t = p.clone();
         t.swap(10, 11);
-        assert_eq!(osa_distance(&peq(&p), 64, &t, false), 1);
-        assert_eq!(osa_distance(&peq(&p), 64, &t, true), 1);
+        assert_eq!(osa_distance(&peq(&p), 64, &t, false).0, 1);
+        assert_eq!(osa_distance(&peq(&p), 64, &t, true), (1, 1));
     }
 
     fn s(tok: &str, name: &str) -> Option<i32> {
-        Pattern::new(&fold_all(tok.as_bytes()), true)
-            .score(&fold_all(name.as_bytes()), name.as_bytes())
+        Pattern::new(&fold_all(tok.as_bytes()), true).score(&fold_all(name.as_bytes()), name.as_bytes())
     }
 
     #[test]
@@ -481,10 +509,7 @@ mod tests {
         let sub = s("port", "airportcodes").unwrap();
         let fz = s("rpt", "report").unwrap();
         assert_eq!(exact, EXACT);
-        assert!(
-            exact > stem && stem > prefix && prefix > word,
-            "{exact} {stem} {prefix} {word}"
-        );
+        assert!(exact > stem && stem > prefix && prefix > word, "{exact} {stem} {prefix} {word}");
         assert!(word > SUBSTR - 100 && sub < WORD && sub > fz, "{sub} {fz}");
         assert!(fz <= FUZZY_MAX);
     }
@@ -497,14 +522,7 @@ mod tests {
     #[test]
     fn typos_anywhere() {
         // swap, drop, insert, substitute – including the first character.
-        for q in [
-            "flashfnid",
-            "flashfid",
-            "flashfiind",
-            "flashfund",
-            "lfashfind",
-            "glashfind",
-        ] {
+        for q in ["flashfnid", "flashfid", "flashfiind", "flashfund", "lfashfind", "glashfind"] {
             let sc = s(q, "flashfind.rs");
             assert!(sc.is_some(), "{q}");
         }
@@ -515,6 +533,19 @@ mod tests {
         // Two edits only for 8+ bytes.
         assert!(s("invocie_drfat", "invoice_draft.pdf").is_some());
         assert_eq!(s("tsxt", "tabcdef"), None);
+    }
+
+    #[test]
+    fn whole_stem_typo_beats_scattered_subsequence() {
+        let typo = s("migratoin21", "migration21.py").unwrap();
+        let scattered = s("migratoin21", "migration-index-2018.png").unwrap();
+        assert!(typo > scattered, "{typo} {scattered}");
+        let target = s("contrac97", "contract97.jpg").unwrap();
+        let other = s("contrac97", "contract973.md").unwrap();
+        assert!(target > other, "{target} {other}");
+        let target = s("cluvster_settings", "cluster_settings.css").unwrap();
+        let other = s("cluvster_settings", "cluster_settings_v5.docx").unwrap();
+        assert!(target > other + 40, "{target} {other}");
     }
 
     #[test]

@@ -5,10 +5,7 @@ use std::path::PathBuf;
 
 pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<Listing> {
     let threads = opts.threads.max(1);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .expect("thread pool");
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("thread pool");
     let sink = Sink::new(threads);
     let root_dev = dev_of(root);
     pool.scope(|s| list(s, root.to_path_buf(), 0, root_dev, opts, &sink));
@@ -35,18 +32,8 @@ fn bytes(p: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Owned(p.to_string_lossy().into_owned().into_bytes())
 }
 
-fn list<'s>(
-    s: &rayon::Scope<'s>,
-    path: PathBuf,
-    id: u32,
-    dev: Option<u64>,
-    opts: &'s ScanOptions,
-    sink: &'s Sink,
-) {
-    let mut l = Listing {
-        id,
-        ..Default::default()
-    };
+fn list<'s>(s: &rayon::Scope<'s>, path: PathBuf, id: u32, dev: Option<u64>, opts: &'s ScanOptions, sink: &'s Sink) {
+    let mut l = Listing { id, ..Default::default() };
     let mut kids = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&path) {
         for de in rd.flatten() {
@@ -71,11 +58,7 @@ fn list<'s>(
                     kind |= FLAG_MOUNT;
                 }
             }
-            let size = if kind & KIND_MASK == KIND_FILE {
-                md.len()
-            } else {
-                0
-            };
+            let size = if kind & KIND_MASK == KIND_FILE { md.len() } else { 0 };
             let mtime = md
                 .modified()
                 .ok()

@@ -10,12 +10,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub fn run(mut a: Args) {
-    let file = a
-        .opt(&["-i", "--index"])
-        .unwrap_or_else(|| crate::die("-i is required"));
-    let qfile = a
-        .opt(&["--queries"])
-        .unwrap_or_else(|| crate::die("--queries is required"));
+    let file = a.opt(&["-i", "--index"]).unwrap_or_else(|| crate::die("-i is required"));
+    let qfile = a.opt(&["--queries"]).unwrap_or_else(|| crate::die("--queries is required"));
     let repeat = a.num(&["--repeat"], 5usize);
     let limit = a.num(&["--limit"], 50usize);
     let out = a.opt(&["--out"]);
@@ -41,12 +37,7 @@ pub fn run(mut a: Args) {
             let class = v["class"].as_str().unwrap().to_string();
             let expect = v["expect"].as_str();
             let qs: Vec<String> = if class == "keys" {
-                v["seq"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|s| s.as_str().unwrap().to_string())
-                    .collect()
+                v["seq"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
             } else {
                 vec![v["q"].as_str().unwrap().to_string()]
             };
@@ -73,16 +64,7 @@ pub fn run(mut a: Args) {
             }
         }
     }
-    let v = summarize(
-        &label,
-        load_ms,
-        idx.bytes() as u64,
-        peak_rss(),
-        repeat,
-        limit,
-        lat,
-        hit1,
-    );
+    let v = summarize(&label, load_ms, idx.bytes() as u64, peak_rss(), repeat, limit, lat, hit1);
     let s = serde_json::to_string_pretty(&v).unwrap();
     match out {
         Some(f) => std::fs::write(f, s).unwrap_or_else(|e| crate::die(e)),

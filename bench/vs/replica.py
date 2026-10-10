@@ -15,10 +15,27 @@ import gzip, os, shutil, subprocess, sys, tarfile, tempfile, time
 def run(*a, **k):
     return subprocess.run(a, check=True, **k)
 
+def unquote(p):
+    """Undo git's C-style quoting of unusual paths ("a\\303\\251.txt")."""
+    if not (p.startswith('"') and p.endswith('"')):
+        return p
+    b, s, i = bytearray(), p[1:-1], 0
+    esc = {"n": 10, "t": 9, '"': 34, "\\": 92, "a": 7, "b": 8, "f": 12, "r": 13, "v": 11}
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            n = s[i + 1]
+            if n in "01234567":
+                b.append(int(s[i + 1:i + 4], 8)); i += 4; continue
+            b.append(esc.get(n, ord(n))); i += 2; continue
+        b += c.encode(); i += 1
+    return b.decode("utf-8", "surrogateescape")
+
 def manifest_from_clone(url, work):
     run("git", "clone", "-q", "--depth", "1", "--filter=blob:none", "--no-checkout", url, work)
-    out = subprocess.run(["git", "-C", work, "ls-tree", "-r", "--full-tree", "HEAD"], check=True, capture_output=True, text=True).stdout
-    paths = [l.split("\t", 1)[1] for l in out.splitlines() if l.split()[1] == "blob"]
+    out = subprocess.run(["git", "-C", work, "ls-tree", "-r", "-z", "--full-tree", "HEAD"], check=True, capture_output=True).stdout
+    recs = [r.decode("utf-8", "surrogateescape") for r in out.split(b"\0") if r]
+    paths = [r.split("\t", 1)[1] for r in recs if r.split()[1] == "blob"]
     run("git", "-C", work, "sparse-checkout", "set", "--no-cone", ".gitignore", "**/.gitignore", capture_output=True)
     run("git", "-C", work, "checkout", "-q", "HEAD")
     ignores = {}
@@ -30,7 +47,7 @@ def manifest_from_clone(url, work):
     return paths, ignores
 
 def manifest_from_files(d, name):
-    paths = gzip.open(os.path.join(d, f"{name}.paths.gz"), "rt").read().splitlines()
+    paths = [unquote(p) for p in gzip.open(os.path.join(d, f"{name}.paths.gz"), "rt").read().splitlines()]
     ignores = {}
     with tarfile.open(os.path.join(d, f"{name}-gitignores.tgz")) as t:
         for m in t.getmembers():

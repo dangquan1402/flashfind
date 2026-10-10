@@ -359,37 +359,48 @@ python3 bench/vs/render.py run.cast out.png [--marker race] [--mp4 out.mp4]   # 
 is used from `../fsearch` and cloned there if missing). It installs nothing
 system-wide. fsearch is macOS-only, so on Linux the race is flashfind vs fff.
 
-Median latency (Apple M5 Pro, macOS 26.5.1, **heavily loaded machine**, see
-[bench/VS_RESULTS.md](bench/VS_RESULTS.md) for p95/p99 and method):
+Median latency (Apple M5 Pro, macOS 26.5.1, loaded machine: load average
+27–35 during the run; see [bench/VS_RESULTS.md](bench/VS_RESULTS.md) for
+p95/p99, method and the before/after of the optimization pass):
 
 | dataset | query | flashfind | fff | fsearch |
 |---|---|---|---|---|
-| Chromium tree, 507k files | exact name | 3.3 ms | 35 ms | **1.1 ms** |
-| | with a typo | 2.9 ms | 34 ms | **1.0 ms** |
-| | per keystroke | **0.25 ms** | 32 ms | 0.96 ms |
+| Chromium tree, 507k files | exact name | 0.63 ms | 22 ms | **0.57 ms** |
+| | with a typo | 0.62 ms | 22 ms | **0.52 ms** |
+| | folder + name | 3.3 ms | 5.7 ms | **1.7 ms** |
+| | per keystroke | **0.22 ms** | 17 ms | 0.39 ms |
 | | typo → right file first | 95% | 86% | **98%** |
-| | ready cold / memory | 4.9 s / 204 MB | 4.8 s / 209 MB | **1.5 s / 126 MB** |
-| Linux tree, 96k files | exact / typo | 0.25 / 0.25 ms | 1.9 / 1.8 ms | **0.19 / 0.18 ms** |
-| | per keystroke | **0.12 ms** | 1.8 ms | 0.22 ms |
-| 200 repos + junk, 48k files | exact / typo | **0.14 / 0.12 ms** | 1.9 / 1.7 ms | 0.34 / 0.30 ms |
-| | per keystroke | **0.19 ms** | 2.2 ms | 0.57 ms |
+| | ready cold | 1.4 s | 2.2 s | **0.93 s** |
+| | memory | **74 MB** | 207 MB | 132 MB |
+| Linux tree, 96k files | exact / typo | 0.19 / 0.19 ms | 1.0 / 1.0 ms | **0.14 / 0.13 ms** |
+| | per keystroke | **78 µs** | 1.2 ms | 0.17 ms |
+| | ready cold / memory | 154 ms / 33 MB | 186 ms / 43 MB | **99 ms / 26 MB** |
+| 200 repos + junk, 48k files | exact / typo | **0.12 / 0.12 ms** | 1.1 / 0.97 ms | 0.22 / 0.20 ms |
+| | per keystroke | **82 µs** | 0.85 ms | 0.23 ms |
 | | junk in top 10 | **0%** | 5% | 29–43% |
-| | `repo:` queries | **0.16 ms, 100% first** | – | – |
+| | `repo:` queries | **0.10 ms, 100% first** | – | – |
 
-Where flashfind loses:
-- **fsearch is about 3× faster per one-shot name query on one big repo**, and
-  also builds its index about 3× faster with about 40% less memory there.
-  flashfind's code engine pays for repo mapping and project-aware ranking on
-  every query.
-- **fff starts slightly faster and uses a little less memory** on the
-  multi-repo tree.
+Where flashfind still loses:
+- **One-shot name search on one big repo**: fsearch is about 10–20% faster on
+  Chromium (0.57 vs 0.63 ms exact, 0.52 vs 0.62 ms typo) and about 30% faster
+  on Linux. The gap was 3× before the optimization pass. What remains is the
+  name scan itself: flashfind's typo model (OSA distance anywhere in the name,
+  up to 2 edits) checks more candidates than fsearch's (one edit, at a word
+  start).
+- **Folder + name queries on Chromium** (3.3 vs 1.7 ms).
+- **Cold build**: 1.4 s vs 0.93 s on Chromium. flashfind honors .gitignore
+  through the `ignore` crate, so every folder is read twice on macOS (readdir
+  for the walk, getattrlistbulk for sizes and mtimes).
 - **Typo top-1 on Chromium is 95%**, behind fsearch's 98%.
+- On the small Linux tree fsearch also uses a little less memory.
 
 Where flashfind wins:
 - **Typing**: incremental narrowing makes each keystroke cheaper than a fresh
-  search.
-- **Many repos at once**: gitignore-aware, no junk, `repo:` filters.
-- **fff in every latency row** (about 10×).
+  search (about 2× fsearch).
+- **Memory on big repos**: 74 MB vs 132 MB on Chromium.
+- **Many repos at once**: gitignore-aware, no junk, `repo:` filters, fastest
+  in every row.
+- **fff in every latency row** (5–35×).
 
 ![race view](docs/bench-vs-race.png)
 

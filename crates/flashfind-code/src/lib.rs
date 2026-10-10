@@ -253,16 +253,6 @@ fn bytes_to_path(b: &[u8]) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn path_into_bytes(p: PathBuf) -> Vec<u8> {
-    use std::os::unix::ffi::OsStringExt;
-    p.into_os_string().into_vec()
-}
-#[cfg(not(unix))]
-fn path_into_bytes(p: PathBuf) -> Vec<u8> {
-    p.to_string_lossy().into_owned().into_bytes()
-}
-
-#[cfg(unix)]
 fn pbytes(p: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     p.as_os_str().as_bytes().to_vec()
@@ -287,49 +277,11 @@ fn common_root(paths: &[PathBuf]) -> PathBuf {
     root
 }
 
-struct Ent {
-    /// Absolute path bytes.
-    path: Vec<u8>,
-    kind: u8,
-    size: u64,
-    mtime: i64,
-}
-
 /// Children of a listing sorted by name (the order the index keeps).
 fn sort_listing(l: &mut Listing) {
     let names = &l.names;
     l.ents
         .sort_by(|a, b| names[a.name_off as usize..a.name_off as usize + a.name_len as usize].cmp(&names[b.name_off as usize..b.name_off as usize + b.name_len as usize]));
-}
-
-/// Give entries without attributes (`mtime == i64::MIN`) the size and mtime
-/// from their folder's bulk listing (sorted by name), else from lstat.
-fn fill_attrs(ents: &mut [Ent], bulk: &[(Vec<u8>, Listing)]) {
-    use rayon::prelude::*;
-    if bulk.is_empty() && ents.iter().all(|e| e.mtime != i64::MIN) {
-        return;
-    }
-    let mut by_dir: ByteMap<&Listing> = ByteMap::default();
-    by_dir.reserve(bulk.len());
-    for (p, l) in bulk {
-        by_dir.insert(p, l);
-    }
-    ents.par_iter_mut().with_min_len(4096).for_each(|e| {
-        if e.mtime != i64::MIN {
-            return;
-        }
-        let hit = split_path(&e.path).and_then(|(parent, name)| {
-            let l = by_dir.get(parent)?;
-            let i = l.ents.binary_search_by(|r| l.name(r).cmp(name)).ok()?;
-            let r = &l.ents[i];
-            Some((r.size, r.mtime))
-        });
-        let (size, mt) = hit.unwrap_or_else(|| {
-            std::fs::symlink_metadata(bytes_to_path(&e.path)).map_or((0, 0), |m| (m.len(), flashfind_core::walk::mtime_of(&m)))
-        });
-        e.size = if e.kind == KIND_FILE { size } else { 0 };
-        e.mtime = mt;
-    });
 }
 
 type ByteMap<'a, V> = HashMap<&'a [u8], V, std::hash::BuildHasherDefault<flashfind_core::index::Fx>>;
@@ -344,51 +296,263 @@ fn split_path(p: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((if i == 0 { &p[..1] } else { &p[..i] }, name))
 }
 
-/// Stitch walker entries into crawler listings below `root`. Works on raw
-/// path bytes (memcmp sort, byte-slice hash map); each listing's children
-/// end up sorted by name, the order `Index::build_refs` keeps.
-fn listings(root: &Path, mut ents: Vec<Ent>) -> Vec<Listing> {
+fn kind_of(ft: &std::fs::FileType) -> u8 {
+    if ft.is_symlink() {
+        KIND_LINK
+    } else if ft.is_dir() {
+        KIND_DIR
+    } else if ft.is_file() {
+        KIND_FILE
+    } else {
+        KIND_OTHER
+    }
+}
+
+fn lstat_attrs(p: &[u8]) -> (u64, i64) {
+    std::fs::symlink_metadata(bytes_to_path(p)).map_or((0, 0), |m| (m.len(), flashfind_core::walk::mtime_of(&m)))
+}
+
+/// Children of one visited folder that the walker accepted (gitignore and
+/// junk rules), collected on the thread that read the folder.
+struct Run {
+    dir: Vec<u8>,
+    names: Vec<u8>,
+    kids: Vec<(u32, u16, u8)>,
+}
+
+thread_local! {
+    static RUN: std::cell::RefCell<Option<Run>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A finished run: its folder's listing, children sorted by name, with
+/// sizes and mtimes (macOS: one getattrlistbulk call for the folder; else
+/// lstat per child).
+fn finish_run(run: Run) -> (Vec<u8>, Listing) {
+    let name = |k: &(u32, u16, u8)| &run.names[k.0 as usize..k.0 as usize + k.1 as usize];
+    let mut kids = run.kids.clone();
+    kids.sort_unstable_by(|a, b| name(a).cmp(name(b)));
+    let mut bulk = if cfg!(target_os = "macos") && !kids.is_empty() { flashfind_core::walk::list_dir(bytes_to_path(&run.dir).as_ref()) } else { None };
+    if let Some(b) = bulk.as_mut() {
+        sort_listing(b);
+    }
+    let mut l = Listing::default();
+    l.names.reserve(run.names.len());
+    l.ents.reserve(kids.len());
+    let mut path = run.dir.clone();
+    for k in &kids {
+        let n = name(k);
+        let found = bulk.as_ref().and_then(|b| {
+            let i = b.ents.binary_search_by(|r| b.name(r).cmp(n)).ok()?;
+            Some((b.ents[i].size, b.ents[i].mtime))
+        });
+        let (size, mt) = found.unwrap_or_else(|| {
+            path.truncate(run.dir.len());
+            path.push(b'/');
+            path.extend_from_slice(n);
+            lstat_attrs(&path)
+        });
+        l.push(n, k.2, if k.2 == KIND_FILE { size } else { 0 }, mt);
+    }
+    (run.dir, l)
+}
+
+/// What the crawl produced: one listing per visited folder, the walk roots,
+/// and children recorded outside their folder's run (not expected).
+#[derive(Default)]
+struct Crawl {
+    runs: Vec<(Vec<u8>, Listing)>,
+    roots: Vec<Vec<u8>>,
+    strays: Vec<(Vec<u8>, u8)>,
+}
+
+/// Walk the repos with the `ignore` crate (it alone decides what is
+/// included) without materializing a path per entry: its parallel walker
+/// visits a folder and then, on the same thread, runs `filter_entry` on each
+/// child that passed the ignore rules; those children are appended to the
+/// thread's current run, which is finished into a listing when the thread's
+/// next visit begins (or the thread ends).
+fn crawl_listings(cfg: &Config, paths: &[PathBuf]) -> Crawl {
+    let out: Arc<Mutex<Crawl>> = Arc::default();
+    let Some((first, rest)) = paths.split_first() else { return Crawl::default() };
+    let mut wb = ignore::WalkBuilder::new(first);
+    for p in rest {
+        wb.add(p);
+    }
+    let junk = cfg.junk.clone();
+    let strays = out.clone();
+    wb.hidden(false)
+        .git_ignore(cfg.gitignore)
+        .git_exclude(cfg.gitignore)
+        .git_global(cfg.gitignore)
+        .ignore(cfg.gitignore)
+        .parents(cfg.gitignore)
+        .require_git(false)
+        .follow_links(false)
+        .threads(cfg.threads)
+        .filter_entry(move |e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let n = e.file_name().to_string_lossy();
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+            if junk.iter().any(|j| *j == n) && is_dir || n == ".git" || n == ".DS_Store" {
+                return false;
+            }
+            let kind = e.file_type().map_or(KIND_OTHER, |t| kind_of(&t));
+            let name = pbytes(Path::new(e.file_name()));
+            let parent = e.path().parent().map(pbytes);
+            let placed = RUN.with_borrow_mut(|c| match c {
+                Some(run) if parent.as_deref() == Some(&run.dir[..]) && name.len() <= u16::MAX as usize => {
+                    run.kids.push((run.names.len() as u32, name.len() as u16, kind));
+                    run.names.extend_from_slice(&name);
+                    true
+                }
+                _ => false,
+            });
+            if !placed {
+                strays.lock().unwrap().strays.push((pbytes(e.path()), kind));
+            }
+            true
+        });
+    wb.build_parallel().run(|| {
+        struct Sink {
+            out: Arc<Mutex<Crawl>>,
+            runs: Vec<(Vec<u8>, Listing)>,
+            roots: Vec<Vec<u8>>,
+        }
+        impl Sink {
+            fn close_run(&mut self) {
+                if let Some(run) = RUN.with_borrow_mut(|c| c.take()) {
+                    self.runs.push(finish_run(run));
+                }
+            }
+        }
+        impl Drop for Sink {
+            fn drop(&mut self) {
+                self.close_run();
+                let mut o = self.out.lock().unwrap();
+                o.runs.append(&mut self.runs);
+                o.roots.append(&mut self.roots);
+            }
+        }
+        let mut sink = Sink {
+            out: out.clone(),
+            runs: Vec::new(),
+            roots: Vec::new(),
+        };
+        Box::new(move |r| {
+            sink.close_run();
+            let Ok(e) = r else { return ignore::WalkState::Continue };
+            if e.depth() == 0 {
+                sink.roots.push(pbytes(e.path()));
+            }
+            if e.file_type().is_some_and(|t| t.is_dir() && !t.is_symlink()) {
+                RUN.set(Some(Run {
+                    dir: pbytes(e.path()),
+                    names: Vec::new(),
+                    kids: Vec::new(),
+                }));
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    // Every worker's sink has been dropped once `run` returns.
+    std::mem::take(&mut *out.lock().unwrap())
+}
+
+/// Link the crawl's folder listings below `root` (listing 0): child folder
+/// entries point at their listing; walk roots hang off a chain of ancestor
+/// listings (mtime 0, as they were not walked).
+fn assemble_listings(root: &Path, crawl: Crawl) -> Vec<Listing> {
     let rootb = pbytes(root);
     let under = |p: &[u8]| p.len() > rootb.len() && p.starts_with(&rootb) && (rootb.ends_with(b"/") || p[rootb.len()] == b'/');
-    ents.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    let mut dir_mtime: ByteMap<i64> = ByteMap::default();
-    for e in &ents {
-        if e.kind & KIND_MASK == KIND_DIR {
-            dir_mtime.insert(&e.path, e.mtime);
+    let Crawl { runs, roots, strays } = crawl;
+    let (dirs, mut ls): (Vec<Vec<u8>>, Vec<Listing>) = std::iter::once((rootb.clone(), Listing::default())).chain(runs).unzip();
+    // A run for `root` itself replaces the empty listing 0.
+    let mut ids: ByteMap<u32> = ByteMap::default();
+    ids.reserve(dirs.len());
+    ids.insert(&dirs[0], 0);
+    for (i, d) in dirs.iter().enumerate().skip(1) {
+        if *d == rootb {
+            ls.swap(0, i);
+            ls[i] = Listing::default();
+            continue;
+        }
+        ids.insert(d, i as u32);
+    }
+    for (i, l) in ls.iter_mut().enumerate() {
+        l.id = i as u32;
+    }
+    let mut path = Vec::new();
+    for i in 0..ls.len() {
+        let dir = if i == 0 { &rootb } else { &dirs[i] };
+        let l = &mut ls[i];
+        for e in 0..l.ents.len() {
+            if l.ents[e].kind & KIND_MASK != KIND_DIR {
+                continue;
+            }
+            path.clear();
+            path.extend_from_slice(dir);
+            if !dir.ends_with(b"/") {
+                path.push(b'/');
+            }
+            path.extend_from_slice(l.name(&l.ents[e]));
+            if let Some(&c) = ids.get(&path[..]) {
+                l.ents[e].child = c;
+            }
         }
     }
-    let mut ls: Vec<Listing> = vec![Listing::default()];
-    let mut ids: ByteMap<u32> = ByteMap::default();
-    ids.insert(&rootb, 0);
-    fn ensure<'a>(dir: &'a [u8], under: &dyn Fn(&[u8]) -> bool, ls: &mut Vec<Listing>, ids: &mut ByteMap<'a, u32>, mt: &ByteMap<i64>) -> Option<u32> {
-        if let Some(&i) = ids.get(dir) {
+    // Walk roots (and any stray entries) below ancestor chains.
+    let mut chain: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut touched: Vec<u32> = Vec::new();
+    fn ensure(dir: &[u8], under: &dyn Fn(&[u8]) -> bool, ls: &mut Vec<Listing>, ids: &ByteMap<u32>, chain: &mut HashMap<Vec<u8>, u32>, touched: &mut Vec<u32>) -> Option<u32> {
+        if let Some(&i) = ids.get(dir).or_else(|| chain.get(dir)) {
             return Some(i);
         }
         if !under(dir) {
             return None;
         }
         let (parent, name) = split_path(dir)?;
-        let pid = ensure(parent, under, ls, ids, mt)?;
+        let pid = ensure(parent, under, ls, ids, chain, touched)?;
         let id = ls.len() as u32;
         ls.push(Listing { id, ..Default::default() });
-        let i = ls[pid as usize].push(name, KIND_DIR, 0, mt.get(dir).copied().unwrap_or(0))?;
+        let i = ls[pid as usize].push(name, KIND_DIR, 0, 0)?;
         ls[pid as usize].ents[i].child = id;
-        ids.insert(dir, id);
+        touched.push(pid);
+        chain.insert(dir.to_vec(), id);
         Some(id)
     }
-    for e in &ents {
-        if e.kind & KIND_MASK == KIND_DIR {
-            ensure(&e.path, &under, &mut ls, &mut ids, &dir_mtime);
-        } else if let Some((parent, name)) = split_path(&e.path)
-            && let Some(pid) = ensure(parent, &under, &mut ls, &mut ids, &dir_mtime)
-        {
-            ls[pid as usize].push(name, e.kind, e.size, e.mtime);
+    let add = |p: &[u8], kind: u8, ls: &mut Vec<Listing>, chain: &mut HashMap<Vec<u8>, u32>, touched: &mut Vec<u32>| {
+        let Some((parent, name)) = split_path(p) else { return };
+        let Some(pid) = ensure(parent, &under, ls, &ids, chain, touched) else { return };
+        let child = if kind == KIND_DIR { ids.get(p).copied() } else { None };
+        let l = &mut ls[pid as usize];
+        if let Some(e) = l.ents.iter().position(|r| l.name(r) == name) {
+            if let Some(c) = child {
+                l.ents[e].child = c;
+            }
+            return;
+        }
+        let (size, mt) = lstat_attrs(p);
+        if let Some(i) = l.push(name, kind, if kind == KIND_FILE { size } else { 0 }, mt) {
+            if let Some(c) = child {
+                l.ents[i].child = c;
+            }
+            touched.push(pid);
+        }
+    };
+    for r in &roots {
+        if *r != rootb {
+            add(r, KIND_DIR, &mut ls, &mut chain, &mut touched);
         }
     }
-    drop(ids);
-    drop(dir_mtime);
-    for l in &mut ls {
-        sort_listing(l);
+    for (p, kind) in &strays {
+        add(p, *kind, &mut ls, &mut chain, &mut touched);
+    }
+    touched.sort_unstable();
+    touched.dedup();
+    for i in touched {
+        sort_listing(&mut ls[i as usize]);
     }
     ls
 }
@@ -589,113 +753,27 @@ impl CodeIndex {
         let t1 = Instant::now();
         let paths: Vec<PathBuf> = repos.iter().map(|r| r.path.clone()).collect();
         let root = root.to_path_buf();
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<Ent>>();
-        let (btx, brx) = std::sync::mpsc::channel::<Vec<(Vec<u8>, Listing)>>();
-        if let Some((first, rest)) = paths.split_first() {
-            let mut wb = ignore::WalkBuilder::new(first);
-            for p in rest {
-                wb.add(p);
-            }
-            let junk = cfg.junk.clone();
-            wb.hidden(false)
-                .git_ignore(cfg.gitignore)
-                .git_exclude(cfg.gitignore)
-                .git_global(cfg.gitignore)
-                .ignore(cfg.gitignore)
-                .parents(cfg.gitignore)
-                .require_git(false)
-                .follow_links(false)
-                .threads(cfg.threads)
-                .filter_entry(move |e| {
-                    if e.depth() == 0 {
-                        return true;
-                    }
-                    let n = e.file_name().to_string_lossy();
-                    !(junk.iter().any(|j| *j == n) && e.file_type().is_some_and(|t| t.is_dir()) || n == ".git" || n == ".DS_Store")
-                });
-            // On macOS, sizes and mtimes come from one getattrlistbulk call
-            // per accepted directory instead of an lstat per entry; the
-            // walker still decides what is included (gitignore semantics).
-            let bulk_attrs = cfg!(target_os = "macos");
-            let btx = btx.clone();
-            wb.build_parallel().run(|| {
-                let tx = tx.clone();
-                let btx = btx.clone();
-                struct Flush(std::sync::mpsc::Sender<Vec<Ent>>, Vec<Ent>, std::sync::mpsc::Sender<Vec<(Vec<u8>, Listing)>>, Vec<(Vec<u8>, Listing)>);
-                impl Drop for Flush {
-                    fn drop(&mut self) {
-                        let _ = self.0.send(std::mem::take(&mut self.1));
-                        let _ = self.2.send(std::mem::take(&mut self.3));
-                    }
-                }
-                let mut f = Flush(tx, Vec::with_capacity(4096), btx, Vec::new());
-                Box::new(move |r| {
-                    let Ok(e) = r else { return ignore::WalkState::Continue };
-                    let Some(ft) = e.file_type() else { return ignore::WalkState::Continue };
-                    let kind = if ft.is_symlink() {
-                        KIND_LINK
-                    } else if ft.is_dir() {
-                        KIND_DIR
-                    } else if ft.is_file() {
-                        KIND_FILE
-                    } else {
-                        KIND_OTHER
-                    };
-                    let (size, mt) = if bulk_attrs {
-                        (0, i64::MIN)
-                    } else {
-                        let md = e.metadata().ok();
-                        md.map_or((0, 0), |m| (if kind == KIND_FILE { m.len() } else { 0 }, flashfind_core::walk::mtime_of(&m)))
-                    };
-                    if bulk_attrs
-                        && kind == KIND_DIR
-                        && let Some(mut l) = flashfind_core::walk::list_dir(e.path())
-                    {
-                        sort_listing(&mut l);
-                        f.3.push((pbytes(e.path()), l));
-                    }
-                    f.1.push(Ent {
-                        path: path_into_bytes(e.into_path()),
-                        kind,
-                        size,
-                        mtime: mt,
-                    });
-                    if f.1.len() >= 4096 {
-                        let _ = f.0.send(std::mem::take(&mut f.1));
-                    }
-                    ignore::WalkState::Continue
-                })
-            });
-        }
-        drop(tx);
-        drop(btx);
         let timing = std::env::var_os("FLASHFIND_TIMING").is_some();
         let fp = |what: &str| {
             if timing {
                 eprintln!("  footprint {what}: {:.1} MB", flashfind_core::walk::footprint_mb());
             }
         };
-        fp("before collect");
-        let mut ents: Vec<Ent> = rx.into_iter().flatten().collect();
-        let bulk: Vec<(Vec<u8>, Listing)> = brx.into_iter().flatten().collect();
+        let crawl = crawl_listings(cfg, &paths);
         fp("after walk");
-        fill_attrs(&mut ents, &bulk);
-        drop(bulk);
-        fp("after fill_attrs + drop bulk");
         let crawl_ms = t1.elapsed().as_secs_f64() * 1e3;
         let t2 = Instant::now();
-        let ls = listings(&root, ents);
-        fp("after listings");
+        let ls = assemble_listings(&root, crawl);
+        fp("after assemble");
         let t_ls = t2.elapsed();
         let refs: Vec<&Listing> = ls.iter().collect();
         let idx = Index::build_refs(&refs, &root, now(), 0);
-        if std::env::var_os("FLASHFIND_TIMING").is_some() {
-            eprintln!("listings {:?}, index build {:?}", t_ls, t2.elapsed() - t_ls);
+        if timing {
+            eprintln!("assemble {:?}, index build {:?}", t_ls, t2.elapsed() - t_ls);
         }
         drop(refs);
-        fp("after index build");
         drop(ls);
-        fp("after drop listings");
+        fp("after index build");
         let build_ms = t2.elapsed().as_secs_f64() * 1e3;
         let info = BuildInfo {
             repos: repos.len(),

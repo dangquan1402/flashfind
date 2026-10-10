@@ -111,7 +111,8 @@ pub fn vscode_last_folder(app_dir: &str) -> Option<PathBuf> {
 
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let o = std::process::Command::new(cmd).args(args).stderr(std::process::Stdio::null()).output().ok()?;
-    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    // lsof exits 1 when some pid is gone or not ours but still prints the rest.
+    (o.status.success() || !o.stdout.is_empty()).then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 /// All descendants of `pid` (via `ps`), newest (highest pid) first.

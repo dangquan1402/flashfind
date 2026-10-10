@@ -54,7 +54,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "flashfind-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flashfind-code",
  "flashfind-core",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "flashfind-code"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flashfind-core",
  "ignore",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "flashfind-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "memchr",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "flashfind-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flashfind-code",
  "flashfind-core",

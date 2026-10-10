@@ -40,6 +40,7 @@ pub struct Task {
     pub t: i64,
     /// Absolute path of the intended file.
     pub path: String,
+    #[allow(dead_code)]
     pub repo: PathBuf,
     /// What the user types (full).
     pub query: String,
@@ -89,6 +90,11 @@ fn variants() -> Vec<Variant> {
         f,
         empty_state: false,
     });
+    v.push(Variant {
+        name: "+ ranked empty state (F4)",
+        f,
+        empty_state: true,
+    });
     v
 }
 
@@ -100,6 +106,9 @@ struct Score {
     rr_sum: f64,
     kto_sum: f64,
     chars_sum: f64,
+    /// MCP `→ Read` hint shown / shown and right (full query).
+    hint: usize,
+    hint_right: usize,
 }
 
 fn stem_query(rel: &str) -> String {
@@ -112,11 +121,16 @@ fn stem_query(rel: &str) -> String {
 }
 
 fn rank_of(sess: &mut CodeSession, q: &str, want: &str, depth: usize) -> usize {
+    rank_hint(sess, q, want, depth).0
+}
+
+/// (rank, would MCP print `→ Read` for the top hit).
+fn rank_hint(sess: &mut CodeSession, q: &str, want: &str, depth: usize) -> (usize, bool) {
     let mut cq = CodeQuery::parse(q);
     cq.limit = depth;
     match sess.search(&cq, &CancelToken::new()) {
-        Ok(r) => r.hits.iter().position(|h| h.path == want).map_or(depth + 1, |i| i + 1),
-        Err(_) => depth + 1,
+        Ok(r) => (r.hits.iter().position(|h| h.path == want).map_or(depth + 1, |i| i + 1), flashfind_code::mcp::confident(&r)),
+        Err(_) => (depth + 1, false),
     }
 }
 
@@ -134,7 +148,7 @@ fn run_variant(live: &Arc<CodeLive>, tasks: &[Task], v: Variant, verbose: bool) 
                 r.git.pin(repo, g.clone());
             }
         }
-        let full = rank_of(&mut sess, &task.query, &task.path, DEPTH);
+        let (full, hint) = rank_hint(&mut sess, &task.query, &task.path, DEPTH);
         // Keystrokes: cheapest prefix at which the file is visible.
         let chars: Vec<char> = task.query.chars().collect();
         let mut best: Option<(usize, usize)> = None; // (cost, k)
@@ -162,6 +176,8 @@ fn run_variant(live: &Arc<CodeLive>, tasks: &[Task], v: Variant, verbose: bool) 
             sc.rr_sum += 1.0 / full as f64;
             sc.kto_sum += kto as f64;
             sc.chars_sum += chars.len() as f64;
+            sc.hint += hint as usize;
+            sc.hint_right += (hint && full == 1) as usize;
         }
         let typed: String = chars[..k].iter().collect();
         mem.record_pick(&typed, &task.path, "open", "eval");
@@ -466,7 +482,7 @@ pub fn cmd_bench_ux(mut a: Args) {
     }
     let measured = tasks.iter().filter(|t| t.measure).count();
     let mut md = format!(
-        "### {label}\n\n{} tasks ({} measured after warm-up), {} entries indexed\n\n| variant | right file first | mean rank | MRR | keystrokes to open | (chars in full query) |\n|---|---|---|---|---|---|\n",
+        "### {label}\n\n{} tasks ({} measured after warm-up), {} entries indexed\n\n| variant | right file first | mean rank | MRR | keystrokes to open | (chars in full query) | MCP → Read shown | → Read right |\n|---|---|---|---|---|---|---|---|\n",
         tasks.len(),
         measured,
         live.stats().entries
@@ -475,13 +491,15 @@ pub fn cmd_bench_ux(mut a: Args) {
         let s = run_variant(&live, &tasks, v, verbose);
         let n = s.n.max(1) as f64;
         let line = format!(
-            "| {} | {:.1}% | {:.2} | {:.3} | {:.2} | {:.2} |\n",
+            "| {} | {:.1}% | {:.2} | {:.3} | {:.2} | {:.2} | {:.1}% | {:.1}% |\n",
             v.name,
             100.0 * s.first as f64 / n,
             s.rank_sum / n,
             s.rr_sum / n,
             s.kto_sum / n,
-            s.chars_sum / n
+            s.chars_sum / n,
+            100.0 * s.hint as f64 / n,
+            100.0 * s.hint_right as f64 / s.hint.max(1) as f64
         );
         eprint!("{line}");
         md.push_str(&line);

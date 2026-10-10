@@ -1,0 +1,19 @@
+# When a release is published, point the Homebrew tap at it.
+# Needs a repo secret HOMEBREW_TAP_TOKEN (a token that can push to
+# dangquan1402/homebrew-flashfind); without it the job is skipped.
+name: bump-formula
+on:
+  release:
+    types: [published]
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bump
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "HOMEBREW_TAP_TOKEN not set, skipping"; exit 0; fi
+          gh auth setup-git
+          scripts/bump-formula.sh "${{ github.event.release.tag_name }}"

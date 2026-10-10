@@ -1,30 +1,68 @@
 # flashfind
 
-**Find anything across all your code projects, instantly, for you and your
+**Find the file you meant, across all your code projects, for you and your
 AI coding agent.**
 
-flashfind discovers every git repository under your home folder and builds
-one index of what is actually *in* them: `.gitignore` is honoured and
-`node_modules`, `target`, `build`, `dist`, `DerivedData`, `.venv`, `Pods`,
-`.git` internals and the like are left out. Then it answers fuzzy,
-typo-tolerant file-name queries across all of them in well under a
-millisecond, grouped by repo, with recently active repos first. It does this
-from the command line, as JSON, or as an **MCP server** that Cursor, Claude
-Code and other agents can call instead of running `find`/`ls` on every repo.
+Raw speed stopped being the problem a while ago: every finder answers in
+milliseconds. What still costs time is the list being *right*. You type
+`readme` and get 300 READMEs; you type `lib.rs` and the one in the project
+you're working in is fifth; your agent runs `find` three times in the wrong
+repo. flashfind is built around getting the file you meant onto the first
+row, and then doing something with it in one keystroke:
 
-Underneath is a general whole-disk file-name engine for macOS (portable to
-Linux) built to be linked in-process and queried on every keystroke, with
-live FSEvents updates. That engine is a re-engineering of
+- **It learns from what you pick.** Open, copy or reveal a result and that
+  file is remembered for that query, and for queries it starts with
+  (`aut` → the file you picked for `auth`). One pick is enough.
+- **It knows what you've been working on.** Files you open and edit get a
+  decayed frecency score (10-day half-life), across every repo, fed by
+  your picks and by the live file watcher.
+- **It knows where you are.** The current project (your shell's folder, the
+  `cwd` an agent passes, or the app that was in front when you hit the
+  hotkey), its uncommitted files and the files in its last commits rank
+  first.
+- **Before you type anything** the launcher already lists what you were
+  working on: this project's uncommitted, just-modified and recently
+  committed files, plus your frequent ones.
+- **Then one keystroke:** ↩ open, ⌥↩ open in Cursor (at `file:LINE`), ⌘C
+  path, ⌘⇧C relative path, ⌥⌘C `@path` for agent chats, ⇥ to mark several.
+- **Agents get steered, not just answered:** the MCP `find_files` reply is
+  compact text with a `→ Read <path> (best match)` line when one result
+  clearly wins, and on zero results it has already tried a looser query.
+
+Personal signals are a *percentage of the match score* (the multiplicative
+design fff uses), so they reorder good matches but a weak fuzzy match can't
+ride them past an exact one. Everything stays on your machine.
+
+| replay eval (`bench/ux`) | right file first | keystrokes to open |
+|---|---|---|
+| synthetic home, 80 repos, 3 seeds: 0.1 ranking | 9.0% | 16.2 |
+| … + everything above | 88.2% | 1.4 |
+| real git history, 323-repo home: 0.1 ranking | @REAL_BASE_RFF@ | @REAL_BASE_KTO@ |
+| … + everything above | @REAL_ALL_RFF@ | @REAL_ALL_KTO@ |
+
+Per-feature numbers and the (honest) caveats are in
+[bench/ux/RESULTS.md](bench/ux/RESULTS.md).
+
+```sh
+brew install dangquan1402/flashfind/flashfind      # builds the tagged release
+# or, prebuilt for Apple Silicon (others build with cargo):
+curl -fsSL https://raw.githubusercontent.com/dangquan1402/flashfind/main/install.sh | sh
+```
+
+Underneath: flashfind discovers every git repository under your home folder
+and builds one index of what is actually *in* them (`.gitignore` honoured;
+`node_modules`, `target`, `dist`, `.venv`, `Pods`, … left out), answers fuzzy,
+typo-tolerant file-name queries across all of them in well under a
+millisecond, and follows changes live (FSEvents). It runs from the command
+line, as JSON, as an **MCP server** for Cursor, Claude Code and other agents,
+and inside a small macOS launcher app. The core is a general whole-disk
+file-name engine built to be linked in-process, a re-engineering of
 [fsearch](https://github.com/noahdunnagan/fsearch); see Credits.
 
-> **Status: early, works, tested on Linux and macOS (Apple Silicon).** Code
-> projects mode (discovery, gitignore-aware index, `repo:`/`lang:`/`dirty:`,
-> CLI, MCP) follows file changes live (FSEvents, ~30 ms change-to-searchable
-> on a real 323-repo home). There is a small macOS demo app over the C API
-> ([FlashFind.app](#flashfindapp-macos-demo)). No content search yet. Not on
-> crates.io.
+> **Status: early, works, tested on Linux and macOS (Apple Silicon).** No
+> content search yet. Not on crates.io.
 
-![FlashFind.app searching 200 synthetic repos](docs/flashfind-app.png)
+![FlashFind.app: suggestions before typing](docs/flashfind-ux.png)
 
 ## Credits
 
@@ -46,7 +84,13 @@ flashfind stands on two MIT-licensed projects. Full license texts are in
     `mtime:`, `in:`).
   - `bench/fsearch-baseline` links upstream fsearch as a library to measure it.
 - **[fff](https://github.com/dmtrKovalenko/fff) by Dmitriy Kovalenko**: no code
-  copied. Ideas taken from it: the engine as an embeddable library with a C ABI
+  copied. The learned ranking borrows fff's ideas: per-file frecency with
+  exponential decay (`fff-core/src/dbs/frecency.rs`), "the file you picked for
+  this query" memory (`dbs/query_tracker.rs`, combo boost), git status and
+  git recency boosts (`git_recency.rs`), and personal boosts that scale with
+  match quality (`score.rs`). So does the agent output: plain-text results
+  with a "read this one" hint, zero-result fallback chains, read-only tool
+  annotations and rule-style server instructions (`fff-mcp`). Earlier ideas: the engine as an embeddable library with a C ABI
   (like `fff-c`) instead of a daemon behind a socket; typo tolerance that grows
   with query length (fff's matcher, frizbee); and a bigram prefilter (fff uses
   one for content search; flashfind uses a per-name bigram signature to skip
@@ -97,12 +141,28 @@ model-retry  (~/oss/model-retry, 14d ago)
   `.gradle`, `.next`, `.turbo`, `.cache`, `coverage`, `.idea`, … are skipped
   even when not ignored (`--no-default-excludes` turns this off;
   `--no-gitignore` disables ignore files).
-- **Ranking:** the usual flashfind score (exact > stem > prefix > word >
-  substring > fuzzy > typo, folder parts of a multi-word query matched against
-  parent folders), plus a small boost for repos active in the last day, week,
-  month or half year. The repo's last activity is the later of its last
-  commit (read from `.git/logs/HEAD`, no git process) and `.git/index`.
-  The boost only reorders results within a score band.
+- **Ranking:** the match score (exact 1000 > stem 900 > prefix 800 > word 700
+  > substring 600 > fuzzy ≤560 > typo ≤545; folder parts of a multi-word
+  query matched against parent folders), then personal boosts as a
+  percentage of it:
+
+  | signal | boost | source |
+  |---|---|---|
+  | picked before for this query (or one it is a prefix of) | up to +60% | picks: app, `flashfind pick` / `code --pick`, MCP `record_pick` and "edited soon after find_files", C API |
+  | frecency of the file | up to +25% | picks (1) + edits seen by the watcher (0.5), 2^(−age/10 days), 5-min cooldown |
+  | current project / current folder | +15% / +5% | `--cwd`, MCP `cwd`, the shell's folder, or the frontmost app |
+  | uncommitted / in the last 3 / 10 commits | +10% / +8% / +4% | `git status` + `git log -n 10`, cached 15 s |
+  | repo frecency, repo recency | ≤5% each | |
+
+  So an exact match with no history (1000) still beats a fuzzy match you
+  picked five times (≤ 560 × 1.6 = 896). Files the matcher would rank too
+  low to fetch (your README among 300) are scored by a second, masked search
+  over just the remembered and current-project files. `flashfind code --why`
+  shows scores and reasons; `--baseline` is the 0.1 ranking.
+- **Memory:** `~/.local/share/flashfind/memory.jsonl` (`FLASHFIND_DATA`,
+  `XDG_DATA_HOME`), append-only JSON lines shared by the app, CLI and MCP
+  server. `flashfind pick --show` prints it, `--forget` clears it.
+- **Current project:** see [Context](#current-project-context).
 - **Filters** on top of the normal query language: `repo:<name>[,<name>]`,
   `lang:<rust|ts|js|py|go|swift|c|cpp|java|kotlin|ruby|php|cs|zig|lua|sh|md|…>`,
   and `dirty:`. The usual `ext:`, `type:`, `size:`, `mtime:`, `!exclude` and
@@ -117,10 +177,32 @@ model-retry  (~/oss/model-retry, 14d ago)
 
 | tool | arguments | returns |
 |---|---|---|
-| `find_files` | `query`, optional `repo`, `lang`, `dirty`, `limit` (20) | `{total, groups:[{repo, root, files:[paths relative to root]}]}` |
-| `list_projects` | optional `filter`, `limit` (50) | `{total, projects:[{name, root, branch, last_commit, active, entries}]}` |
-| `recent_files` | optional `repo`, `lang`, `within` (`7d`), `limit` | same shape as `find_files`, newest first |
+| `find_files` | `query`, optional `cwd`, `repo`, `lang`, `dirty`, `limit` (15), `format` (`text`/`json`) | compact text (below), or `{total, groups:[{repo, root, files}], best, note}` |
+| `list_projects` | optional `filter`, `limit` (50), `format` | one line per project: name, branch, last activity, root |
+| `recent_files` | optional `repo`, `lang`, `within` (`7d`), `limit`, `format` | same shape as `find_files`, newest first |
+| `record_pick` | `path`, `query` | teach the ranking which file the query meant |
 | `reindex` | – | rediscover and rebuild now |
+
+```
+→ Read /Users/me/dev/api/src/auth/middleware.ts (best match)
+3 of 41 matches
+api  ~/dev/api
+  src/auth/middleware.ts  (this project, uncommitted)
+  src/auth/middleware.test.ts  (this project)
+web  ~/dev/web
+  lib/auth/middleware.ts
+```
+
+Borrowed from fff's MCP server: the `→ Read` line appears only when the top
+result is clearly ahead (≥ 8% over the next, or the only one), so the agent
+reads it instead of searching again; zero results fall back to dropping a
+term, then a fuzzier spelling, then "projects with similar names"; the read
+tools carry `readOnlyHint`; numbers accept `20`, `20.0` or `"20"`; and the
+server instructions are short rules ("one call; pass cwd; read the `→ Read`
+file; use `record_pick` if you used another"). Files an agent edits within
+15 minutes of a `find_files` that listed them are recorded as picks for that
+query automatically. Pass `cwd` (or launch the server in the project) and that
+project's files, uncommitted ones first, lead.
 
 The index is loaded from the cache (or built) at startup, caught up with a
 folder-mtime recheck, and then follows FSEvents live, so an agent sees a file
@@ -425,14 +507,39 @@ open dist/FlashFind.app
   takes `repo:` / `lang:` / `dirty:`. **Disk** mode uses a saved whole-disk
   index at `~/.flashfind/index.ffx` if there is one, and otherwise explains
   how to build it (that needs Full Disk Access).
-- ↑/↓ select · ↩ open · ⌘↩ reveal in Finder · ⌥↩ open in Cursor (the repo
-  folder plus the file) · ⌘Y, or Space right after ↑/↓, Quick Look · ⌘C copy
-  path (when no query text is selected) · Esc clear / hide · ⌘1 / ⌘2 mode.
+- **Before you type**, it lists suggestions for the current project:
+  uncommitted, just-modified and recently committed files, plus your
+  frequent and recently picked files, each tagged with why.
+- ↑/↓ select · ↩ open · ⌥↩ open in Cursor (the repo folder plus the file; at
+  the line when the query ends in `:LINE[:COL]`, via `cursor://file/…`; VS
+  Code if Cursor isn't installed) · ⌘↩ reveal in Finder · ⌘C absolute path
+  (when no query text is selected) · ⌘⇧C repo-relative path · ⌥⌘C `@path`
+  mention for agent chats · ⇥ mark rows, then any action applies to all marked
+  · ⌘Y, or Space right after ↑/↓, Quick Look · Esc unmark / clear / hide ·
+  ⌘1 / ⌘2 mode. Every action is recorded as a pick (learned ranking).
+- The footer shows the detected current project (see below).
 - It shares the CLI/MCP cache (`~/.cache/flashfind`), catches up with a
   recheck on launch (70–600 ms, or a ~5 s crawl the first time) and follows
   FSEvents while open.
-- Scriptable for checks: `--query Q`, `--roots A:B`, `--cache DIR`,
+- Scriptable for checks: `--query Q`, `--cwd DIR`, `--roots A:B`, `--cache DIR`,
   `--window-id-file F`, `--snapshot PNG`, `--quit-after SECONDS`.
+
+### Current-project context
+
+Explicit wins: `flashfind code --cwd DIR` (default: the shell's folder),
+`--cwd front`, MCP `find_files` `cwd` (else the server's own folder). The
+launcher looks at the app that was frontmost when the hot key fired, using
+only things that need **no new permission** (`flashfind context` shows what
+it sees):
+
+| frontmost app | how | permission |
+|---|---|---|
+| terminals (iTerm2, Terminal, Ghostty, Warp, WezTerm, kitty, Alacritty) | working directory of its shell processes (`lsof -d cwd`), newest first; it can't tell which tab is focused | none (same user) |
+| Cursor, VS Code, Windsurf, VSCodium | window title, *if* Screen Recording was already granted to FlashFind (checked with `CGPreflightScreenCaptureAccess`, never prompted); else `windowsState.lastActiveWindow` in the editor's `storage.json`, which can lag behind window switches | none, or Screen Recording for titles |
+| anything else (Xcode, Zed, JetBrains…) | cwd of its child processes, else files it holds open (`lsof -p`), majority vote by repo | none |
+
+The exact source, the focused window's title via Accessibility (`AXTitle`),
+is not used because it needs the Accessibility permission prompt.
 
 Known gaps: no app icon, no settings UI (the roots come from
 `FLASHFIND_CODE_ROOTS` or `--roots`), no launch-at-login, and the hot key is

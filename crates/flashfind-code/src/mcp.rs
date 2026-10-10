@@ -1,9 +1,16 @@
 //! Minimal MCP server (JSON-RPC 2.0 over stdio, one message per line) that
 //! exposes the code index to AI coding agents.
 //!
-//! Tools: `find_files`, `list_projects`, `recent_files`, `reindex`.
-//! Results are compact JSON grouped by repo (repo root once, paths relative
-//! to it) to keep agent context small.
+//! Tools: `find_files`, `list_projects`, `recent_files`, `record_pick`,
+//! `reindex`.
+//!
+//! Output is compact plain text by default (`format: "json"` for JSON),
+//! grouped by repo with the root once and paths relative to it. Borrowed
+//! from fff's MCP server (dmtrKovalenko/fff, `crates/fff-mcp`): a
+//! `→ Read <path>` line when one result clearly wins, so the agent opens it
+//! instead of searching again; zero-result fallbacks (drop a term, fuzzier,
+//! closest projects) instead of a bare "0 results"; read-only annotations;
+//! number parameters that also accept 20.0 or "20".
 
 use crate::{CodeIndex, CodeLive, CodeQuery, CodeSession, Config, Memory, Ranker, projects_json, result_json};
 use flashfind_core::CancelToken;
@@ -26,56 +33,67 @@ pub struct Server {
 /// How long a find_files answer can turn a later edit into a pick.
 const IMPLICIT_PICK_WINDOW: i64 = 15 * 60;
 
+fn ro() -> Value {
+    json!({"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false})
+}
+
 fn tools() -> Value {
     json!([
         {
             "name": "find_files",
-            "description": "Find files or folders by name across all local git projects (fuzzy, typo-tolerant; gitignored files and junk like node_modules/target/dist are excluded). Query syntax: words match the file name or a parent folder; ext:rs,ts  type:file|dir  mtime:<7d  size:>1mb  'substr  ^prefix  =exact  !exclude; also repo:<name>, lang:<rust|ts|py|go|swift|...>, dirty: (only files with uncommitted changes). Returns {total, groups:[{repo, root, files:[paths relative to root]}]}.",
+            "description": "Find files or folders by name across all local git projects in one call (fuzzy, typo-tolerant; gitignored files and junk like node_modules/target/dist are excluded). Ranked for you: files of the current project (pass cwd), uncommitted and recently committed files, and files picked before for similar queries come first. If the reply starts with '→ Read <path>', that is the file: read it, don't search again. Query syntax: words match the file name or a parent folder; ext:rs,ts  type:file|dir  mtime:<7d  size:>1mb  'substr  ^prefix  =exact  !exclude; also repo:<name>, lang:<rust|ts|py|go|swift|...>, dirty: (only files with uncommitted changes), file.rs:42 (line suffix is echoed back).",
+            "annotations": ro(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "e.g. \"auth middleware\", \"repo:api ext:ts router\", \"lang:rust parser\". May be empty when repo/lang/dirty is given: then the matching files are listed newest first."},
+                    "query": {"type": "string", "description": "File name words, e.g. \"auth middleware\", \"repo:api ext:ts router\", \"lang:rust parser\". May be empty when repo/lang/dirty is given: then the matching files are listed newest first."},
                     "repo": {"type": "string", "description": "Restrict to projects whose name matches (exact, prefix or substring)."},
                     "lang": {"type": "string", "description": "Restrict to a language's file extensions."},
                     "dirty": {"type": "boolean", "description": "Only files with uncommitted changes (runs git status)."},
                     "cwd": {"type": "string", "description": "Your working directory: files of that project (and its uncommitted / recently committed files) rank first."},
-                    "limit": {"type": "integer", "description": "Max results (default 20, max 200)."}
+                    "limit": {"type": "integer", "description": "Max results (default 15, max 200)."},
+                    "format": {"type": "string", "enum": ["text", "json"], "description": "text (default, compact) or json."}
                 },
                 "required": []
             }
         },
         {
             "name": "list_projects",
-            "description": "List local git projects, most recently active first: {total, projects:[{name, root, branch, last_commit, active, entries}]} (times are Unix seconds).",
+            "description": "List local git projects, most recently active first (name, branch, last activity, root).",
+            "annotations": ro(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "filter": {"type": "string", "description": "Substring of the project name."},
-                    "limit": {"type": "integer", "description": "Max projects (default 50)."}
+                    "limit": {"type": "integer", "description": "Max projects (default 50)."},
+                    "format": {"type": "string", "enum": ["text", "json"]}
                 }
             }
         },
         {
             "name": "recent_files",
             "description": "Most recently modified files across projects (gitignored/junk excluded), newest first, grouped by repo.",
+            "annotations": ro(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string"},
                     "lang": {"type": "string"},
                     "within": {"type": "string", "description": "Age limit like 30m, 6h, 2d, 1w (default 7d)."},
-                    "limit": {"type": "integer", "description": "Max results (default 20)."}
+                    "limit": {"type": "integer", "description": "Max results (default 20)."},
+                    "format": {"type": "string", "enum": ["text", "json"]}
                 }
             }
         },
         {
             "name": "record_pick",
-            "description": "Tell flashfind which file you actually used for a query (after find_files), so the next search for that query ranks it first. Cheap; call it when the file you opened was not the first result.",
+            "description": "Tell flashfind which file you actually used for a query (after find_files) when it was not the first result, so the next search for that query ranks it first. Files you edit soon after a find_files are learned automatically.",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "The find_files query you searched with."},
-                    "path": {"type": "string", "description": "Absolute path (or repo root + relative path) of the file you used."}
+                    "path": {"type": "string", "description": "Absolute path of the file you used."}
                 },
                 "required": ["path"]
             }
@@ -83,9 +101,96 @@ fn tools() -> Value {
         {
             "name": "reindex",
             "description": "Rediscover projects and rebuild the index now (normally unnecessary: the index follows file changes live).",
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {"type": "object", "properties": {}}
         }
     ])
+}
+
+const INSTRUCTIONS: &str = "flashfind finds files by name across every local git project (gitignore-aware, live-updated). \
+Rules: (1) To locate a file, call find_files once instead of listing directories or globbing; pass cwd (your working directory) so the current project ranks first. \
+(2) If the reply starts with '→ Read <path>', read that file next; do not search again. \
+(3) Prefer repo:<name> to scope to one project, and bare file-name words (e.g. 'auth middleware') over paths. \
+(4) On zero results the reply already tried looser queries; follow its suggestion rather than retrying variants. \
+(5) If you used a file that was not the first result, call record_pick so the next search ranks it first. \
+list_projects shows which repos exist; recent_files shows what changed lately.";
+
+/// Integer argument that also accepts 20.0 and "20" (LLMs send all three).
+fn num(a: &Value, k: &str) -> Option<u64> {
+    match a.get(k)? {
+        Value::Number(n) => n.as_u64().or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f.round() as u64)),
+        Value::String(s) => s.trim().parse::<f64>().ok().filter(|f| *f >= 0.0).map(|f| f.round() as u64),
+        _ => None,
+    }
+}
+
+fn home_abbrev(p: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && p.starts_with(&h) => format!("~{}", &p[h.len()..]),
+        _ => p.to_string(),
+    }
+}
+
+/// Is the top hit a clear winner? (only hit, or ≥8% ahead of the next).
+pub fn confident(r: &crate::CodeResult) -> bool {
+    match r.hits.as_slice() {
+        [] => false,
+        [_] => true,
+        [a, b, ..] => a.kind == "file" && a.score as f64 >= b.score as f64 * 1.08,
+    }
+}
+
+/// Compact text: optional `→ Read` line, a count line, then per repo
+/// `name  root` and indented relative paths (with why-tags).
+pub fn result_text(r: &crate::CodeResult, line: Option<u32>, note: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(n) = note {
+        out.push_str(n);
+        out.push('\n');
+    }
+    if confident(r) {
+        let h = &r.hits[0];
+        let at = line.map(|l| format!(":{l}")).unwrap_or_default();
+        out.push_str(&format!("→ Read {}{at} (best match)\n", h.path));
+    }
+    let shown = r.hits.len() as u64;
+    out.push_str(&if r.total > shown { format!("{shown} of {} matches\n", r.total) } else { format!("{shown} matches\n") });
+    for g in &r.groups {
+        out.push_str(&format!("{}  {}\n", g.repo, home_abbrev(&g.root)));
+        for &i in &g.hits {
+            let h = &r.hits[i];
+            let dir = if h.kind == "dir" { "/" } else { "" };
+            if h.why.is_empty() {
+                out.push_str(&format!("  {}{dir}\n", h.rel));
+            } else {
+                out.push_str(&format!("  {}{dir}  ({})\n", h.rel, h.why));
+            }
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+fn projects_text(v: &Value) -> String {
+    let now = crate::memory::now();
+    let mut out = format!("{} projects\n", v["total"]);
+    for p in v["projects"].as_array().into_iter().flatten() {
+        let age = (now - p["active"].as_i64().unwrap_or(0)).max(0);
+        let ago = match age {
+            a if a < 3600 => format!("{}m", a / 60),
+            a if a < 86_400 => format!("{}h", a / 3600),
+            a => format!("{}d", a / 86_400),
+        };
+        out.push_str(&format!(
+            "{}  {}  {} ago  {}\n",
+            p["name"].as_str().unwrap_or(""),
+            p["branch"].as_str().unwrap_or("-"),
+            ago,
+            home_abbrev(p["root"].as_str().unwrap_or(""))
+        ));
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 
 fn parse_age(s: &str) -> Option<i64> {
@@ -161,7 +266,8 @@ impl Server {
 
     fn call(&self, name: &str, a: &Value) -> Result<Value, String> {
         let s = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
-        let limit = |d: u64| a.get("limit").and_then(Value::as_u64).unwrap_or(d).clamp(1, 200) as usize;
+        let limit = |d: u64| num(a, "limit").unwrap_or(d).clamp(1, 200) as usize;
+        let json_out = s("format").is_some_and(|f| f.eq_ignore_ascii_case("json"));
         match name {
             "find_files" => {
                 let mut text = s("query").unwrap_or_default();
@@ -178,11 +284,15 @@ impl Server {
                     text.push_str(" dirty:yes");
                 }
                 let mut cq = CodeQuery::parse(&text);
-                cq.limit = limit(20);
+                cq.limit = limit(15);
                 let cwd = s("cwd").map(PathBuf::from).or_else(|| std::env::current_dir().ok());
                 let mut sess = self.sess.lock().unwrap();
                 sess.set_cwd(cwd.and_then(|c| std::fs::canonicalize(c).ok()));
-                let r = sess.search(&cq, &CancelToken::new())?;
+                let (r, note) = match sess.search(&cq, &CancelToken::new()) {
+                    Ok(r) if r.hits.is_empty() && !cq.text.trim().is_empty() => self.fallback(&mut sess, &cq, r),
+                    Ok(r) => (r, None),
+                    Err(e) => return Err(e),
+                };
                 drop(sess);
                 if self.memory.is_some() && !cq.text.trim().is_empty() {
                     let top: Vec<String> = r.hits.iter().take(10).map(|h| h.path.clone()).collect();
@@ -192,9 +302,22 @@ impl Server {
                         a.remove(0);
                     }
                 }
-                Ok(result_json(&r))
+                if json_out {
+                    let mut v = result_json(&r);
+                    if let Some(n) = note {
+                        v["note"] = json!(n);
+                    }
+                    if confident(&r) {
+                        v["best"] = json!(r.hits[0].path);
+                    }
+                    return Ok(v);
+                }
+                Ok(Value::String(result_text(&r, cq.line, note.as_deref())))
             }
-            "list_projects" => Ok(projects_json(&self.live.repos(), s("filter").as_deref(), limit(50))),
+            "list_projects" => {
+                let v = projects_json(&self.live.repos(), s("filter").as_deref(), limit(50));
+                Ok(if json_out { v } else { Value::String(projects_text(&v)) })
+            }
             "recent_files" => {
                 let mut text = String::new();
                 if let Some(r) = s("repo") {
@@ -210,14 +333,15 @@ impl Server {
                     None => Some(7 * 86_400),
                 };
                 let r = self.sess.lock().unwrap().recent(&cq, within)?;
-                Ok(result_json(&r))
+                Ok(if json_out { result_json(&r) } else { Value::String(result_text(&r, None, None)) })
             }
             "record_pick" => {
                 let path = s("path").ok_or("path is required")?;
                 let abs = std::fs::canonicalize(&path).map_err(|e| format!("{path}: {e}"))?;
                 let m = self.memory.as_ref().ok_or("memory is disabled")?;
-                m.record_pick(&s("query").unwrap_or_default(), &abs.to_string_lossy(), "read", "mcp");
-                Ok(json!({"ok": true}))
+                let q = CodeQuery::parse(&s("query").unwrap_or_default()).text;
+                m.record_pick(&q, &abs.to_string_lossy(), "read", "mcp");
+                Ok(Value::String(format!("ok: {} is now preferred for '{q}'", abs.display())))
             }
             "reindex" => {
                 let t = std::time::Instant::now();
@@ -227,6 +351,62 @@ impl Server {
             }
             _ => Err(format!("unknown tool {name}")),
         }
+    }
+
+    /// Zero results: try looser queries before giving up, and say what was done.
+    fn fallback(&self, sess: &mut CodeSession, cq: &CodeQuery, empty: crate::CodeResult) -> (crate::CodeResult, Option<String>) {
+        let words: Vec<&str> = cq.text.split_whitespace().collect();
+        let run = |sess: &mut CodeSession, text: &str| -> Option<crate::CodeResult> {
+            let mut q = cq.clone();
+            q.text = text.to_string();
+            sess.search(&q, &CancelToken::new()).ok().filter(|r| !r.hits.is_empty())
+        };
+        // 1. Drop one term (the one whose removal still finds something, shortest first).
+        if words.len() > 1 {
+            let mut order: Vec<usize> = (0..words.len()).collect();
+            order.sort_by_key(|&i| words[i].len());
+            for i in order {
+                let rest: Vec<&str> = words.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, w)| *w).collect();
+                if let Some(r) = run(sess, &rest.join(" ")) {
+                    return (r, Some(format!("0 results for '{}'; showing results for '{}' (dropped '{}').", cq.text, rest.join(" "), words[i])));
+                }
+            }
+        }
+        // 2. Fuzzier: strip operators/extensions, then shorten long words.
+        let loose: Vec<String> = words
+            .iter()
+            .map(|w| {
+                let w = w.trim_start_matches(['\'', '^', '=']).trim_end_matches('$');
+                let w = w.rsplit_once('.').map_or(w, |(a, b)| if a.len() >= 3 && b.len() <= 5 { a } else { w });
+                w.to_string()
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        let lq = loose.join(" ");
+        if lq != cq.text
+            && !lq.is_empty()
+            && let Some(r) = run(sess, &lq)
+        {
+            return (r, Some(format!("0 results for '{}'; showing fuzzier '{lq}'.", cq.text)));
+        }
+        let short: Vec<String> = loose.iter().map(|w| if w.chars().count() > 5 { w.chars().take(w.chars().count() * 2 / 3).collect() } else { w.clone() }).collect();
+        let sq = short.join(" ");
+        if sq != lq
+            && let Some(r) = run(sess, &sq)
+        {
+            return (r, Some(format!("0 results for '{}'; showing prefix matches for '{sq}'.", cq.text)));
+        }
+        // 3. Nothing: point at projects with similar names.
+        let snap = self.live.snapshot();
+        let mut near: Vec<String> = words.iter().flat_map(|w| snap.base.similar_repos(w, 3)).collect();
+        near.sort();
+        near.dedup();
+        let hint = if near.is_empty() {
+            "Try fewer or shorter words, or list_projects to see which projects exist.".to_string()
+        } else {
+            format!("Projects with similar names: {}. Try repo:<name> or list_projects.", near.join(", "))
+        };
+        (empty, Some(format!("0 results for '{}' (also tried dropping terms and fuzzier spellings). {hint}", cq.text)))
     }
 
     /// Handle one JSON-RPC message; `None` for notifications.
@@ -240,7 +420,7 @@ impl Server {
                 "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "flashfind", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Use find_files to locate files by (fuzzy) name across every local git project before grepping or listing directories; list_projects to see which repos exist; recent_files for what changed lately."
+                "instructions": INSTRUCTIONS
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tools()})),
@@ -248,6 +428,7 @@ impl Server {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 Ok(match self.call(name, &args) {
+                    Ok(Value::String(t)) => json!({"content": [{"type": "text", "text": t}], "isError": false}),
                     Ok(v) => json!({"content": [{"type": "text", "text": v.to_string()}], "isError": false}),
                     Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
                 })

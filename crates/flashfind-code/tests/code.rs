@@ -225,8 +225,8 @@ fn mcp_protocol() {
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}),
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_files","arguments":{"query":"router","repo":"engine"}}}),
-        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_files","arguments":{"query":"router","repo":"engine","format":"json"}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_projects","arguments":{"format":"json"}}}),
         json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"recent_files","arguments":{"within":"1d","limit":5}}}),
         json!({"jsonrpc":"2.0","id":6,"method":"nope"}),
         json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"find_files","arguments":{}}}),
@@ -257,5 +257,35 @@ fn mcp_protocol() {
     assert_eq!(replies[4]["result"]["isError"], false);
     assert_eq!(replies[5]["error"]["code"], -32601);
     assert_eq!(replies[6]["result"]["isError"], true);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn mcp_text_output_steers_and_falls_back() {
+    let (home, cfg) = world("mcptext");
+    let srv = mcp::Server::from_index(CodeIndex::build(&cfg));
+    let call = |args: Value| -> (String, bool) {
+        let r = srv
+            .handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_files","arguments":args}}))
+            .unwrap();
+        (r["result"]["content"][0]["text"].as_str().unwrap().to_string(), r["result"]["isError"].as_bool().unwrap())
+    };
+    let (t, err) = call(json!({"query": "middleware", "limit": "5"}));
+    assert!(!err);
+    assert!(t.starts_with(&format!("→ Read {}", home.join("dev/webapp/src/auth/middleware.ts").display())), "{t}");
+    assert!(t.contains("webapp  ") && t.contains("  src/auth/middleware.ts"), "{t}");
+    let (t, _) = call(json!({"query": "middleware.ts:42", "limit": 3.0}));
+    assert!(t.lines().next().unwrap().ends_with("middleware.ts:42 (best match)"), "{t}");
+    // Zero results: drop a term.
+    let (t, _) = call(json!({"query": "middleware zzqqxx"}));
+    assert!(t.starts_with("0 results for 'middleware zzqqxx'; showing results for 'middleware'"), "{t}");
+    // Nothing at all: suggest projects.
+    let (t, _) = call(json!({"query": "qqqqzzzz"}));
+    assert!(t.starts_with("0 results for 'qqqqzzzz'"), "{t}");
+    let tools = srv.handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
+    let ff = &tools["result"]["tools"][0];
+    assert_eq!(ff["annotations"]["readOnlyHint"], true);
+    let init = srv.handle(&json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{}})).unwrap();
+    assert!(init["result"]["instructions"].as_str().unwrap().contains("→ Read"));
     let _ = std::fs::remove_dir_all(home);
 }

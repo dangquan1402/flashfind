@@ -1,0 +1,35 @@
+class Flashfind < Formula
+  desc "Find the file you meant across all your git projects (CLI + MCP server)"
+  homepage "https://github.com/dangquan1402/flashfind"
+  url "@URL@"
+  sha256 "@SHA256@"
+  license "MIT"
+  head "https://github.com/dangquan1402/flashfind.git", branch: "main"
+
+  depends_on "rust" => :build
+
+  def install
+    system "cargo", "install", *std_cargo_args(path: "crates/flashfind-cli")
+  end
+
+  def caveats
+    <<~EOS
+      Use it from your AI agent (MCP over stdio):
+        Cursor (~/.cursor/mcp.json):
+          { "mcpServers": { "flashfind": { "command": "#{opt_bin}/flashfind", "args": ["mcp"] } } }
+        Claude Code:
+          claude mcp add --scope user flashfind -- #{opt_bin}/flashfind mcp
+      The first run indexes the git repos under your home folder (a few seconds).
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/flashfind --version")
+    (testpath/"proj/.git").mkpath
+    (testpath/"proj/.git/HEAD").write "ref: refs/heads/main\n"
+    (testpath/"proj/src").mkpath
+    (testpath/"proj/src/router.rs").write "fn main() {}\n"
+    out = shell_output("#{bin}/flashfind code --root #{testpath} --cache #{testpath}/cache --data #{testpath}/data --flat router")
+    assert_match "router.rs", out
+  end
+end

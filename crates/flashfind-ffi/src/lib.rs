@@ -448,7 +448,7 @@ mod tests {
 
 use flashfind_code::{CodeLive, CodeQuery, CodeSession, Config as CodeConfig};
 
-pub struct FfCode(Arc<CodeLive>);
+pub struct FfCode(Arc<CodeLive>, Arc<flashfind_code::Memory>);
 pub struct FfCodeSession(Mutex<CodeSession>);
 
 #[repr(C)]
@@ -466,6 +466,8 @@ pub struct FfCodeHit {
     pub mtime: i64,
     /// Repo's last activity (Unix seconds).
     pub repo_active: i64,
+    /// Why personal ranking moved it ("picked before", …); "" if not.
+    pub why: *const c_char,
 }
 
 #[repr(C)]
@@ -520,7 +522,7 @@ pub unsafe extern "C" fn ff_code_open(roots: *const c_char, cache_dir: *const c_
     if !live.just_built() {
         live.recheck();
     }
-    Box::into_raw(Box::new(FfCode(live)))
+    Box::into_raw(Box::new(FfCode(live, flashfind_code::Memory::open_default())))
 }
 
 /// Follow file changes (FSEvents on macOS; periodic rebuilds elsewhere).
@@ -593,10 +595,24 @@ pub unsafe extern "C" fn ff_code_free(c: *mut FfCode) {
     }
 }
 
+/// Remember that `path` was the file meant for `query` (`action`: open,
+/// copy, reveal, cursor…). Later searches for that query (or a prefix of it)
+/// rank it higher. Returns FF_OK.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_record_pick(c: *const FfCode, query: *const c_char, path: *const c_char, action: *const c_char) -> i32 {
+    let (Some(c), Some(p)) = (unsafe { c.as_ref() }, unsafe { cstr(path) }) else {
+        return FF_ERROR;
+    };
+    let q = unsafe { cstr(query) }.unwrap_or("");
+    let q = flashfind_code::CodeQuery::parse(q).text;
+    c.1.record_pick(&q, p, unsafe { cstr(action) }.unwrap_or("open"), "app");
+    FF_OK
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ff_code_session_new(c: *const FfCode) -> *mut FfCodeSession {
     match unsafe { c.as_ref() } {
-        Some(c) => Box::into_raw(Box::new(FfCodeSession(Mutex::new(CodeSession::new(c.0.clone()))))),
+        Some(c) => Box::into_raw(Box::new(FfCodeSession(Mutex::new(CodeSession::with_ranker(c.0.clone(), flashfind_code::Ranker::new(Some(c.1.clone()))))))),
         None => std::ptr::null_mut(),
     }
 }
@@ -664,11 +680,11 @@ pub unsafe extern "C" fn ff_code_search(
     }
     // Display order: by group, then rank within the group.
     let order: Vec<usize> = res.groups.iter().flat_map(|g| g.hits.iter().copied()).collect();
-    let strs: Vec<[CString; 4]> = order
+    let strs: Vec<[CString; 5]> = order
         .iter()
         .map(|&i| {
             let h = &res.hits[i];
-            [cs(&h.path), cs(&h.rel), cs(&h.repo_name), cs(&h.repo_root)]
+            [cs(&h.path), cs(&h.rel), cs(&h.repo_name), cs(&h.repo_root), cs(&h.why)]
         })
         .collect();
     let hits: Vec<FfCodeHit> = order
@@ -692,6 +708,7 @@ pub unsafe extern "C" fn ff_code_search(
                 size: h.size,
                 mtime: h.mtime,
                 repo_active: h.repo_active,
+                why: st[4].as_ptr(),
             }
         })
         .collect();

@@ -247,7 +247,7 @@ fn mcp_protocol() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["find_files", "list_projects", "recent_files", "reindex"]);
+    assert_eq!(names, vec!["find_files", "list_projects", "recent_files", "record_pick", "reindex"]);
     let text: Value = serde_json::from_str(replies[2]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(text["groups"][0]["repo"], "engine");
     assert_eq!(text["groups"][0]["files"][0], "src/router.rs");

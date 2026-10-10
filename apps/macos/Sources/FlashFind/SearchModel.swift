@@ -199,13 +199,22 @@ final class SearchModel: ObservableObject {
         flashUntil = Date().addingTimeInterval(1.5)
     }
 
+    /// Every action on a result teaches the ranking which file the query meant.
+    private func learn(_ h: Hit, _ action: String) {
+        guard mode == .code, let code else { return }
+        let q = query
+        queue.async { code.recordPick(query: q, path: h.path, action: action) }
+    }
+
     func open() {
         guard let h = selectedHit else { return }
+        learn(h, "open")
         NSWorkspace.shared.open(URL(fileURLWithPath: h.path))
     }
 
     func reveal() {
         guard let h = selectedHit else { return }
+        learn(h, "reveal")
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: h.path)])
     }
 
@@ -223,6 +232,7 @@ final class SearchModel: ObservableObject {
             flash("Cursor is not installed")
             return
         }
+        learn(h, "cursor")
         var urls = [URL(fileURLWithPath: h.path)]
         if mode == .code && !h.repoRoot.isEmpty { urls.insert(URL(fileURLWithPath: h.repoRoot), at: 0) }
         NSWorkspace.shared.open(urls, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
@@ -230,6 +240,7 @@ final class SearchModel: ObservableObject {
 
     func copyPath() {
         guard let h = selectedHit else { return }
+        learn(h, "copy")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(h.path, forType: .string)
         flash("Copied \(abbreviate(h.path))")

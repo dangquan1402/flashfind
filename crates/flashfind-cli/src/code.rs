@@ -2,7 +2,7 @@
 
 use crate::util::{Rng, peak_rss, percentile};
 use crate::{Args, die};
-use flashfind_code::{CodeIndex, CodeLive, CodeQuery, CodeSession, Config};
+use flashfind_code::{CodeIndex, CodeLive, CodeQuery, CodeSession, Config, Memory, Ranker};
 use flashfind_core::walk::ScanOptions;
 use flashfind_core::{CancelToken, Index, Query, Session};
 use serde_json::{Value, json};
@@ -123,14 +123,28 @@ pub fn cmd_projects(mut a: Args) {
     eprintln!("{} projects", v["total"]);
 }
 
+/// The pick/touch memory (`--data DIR`, else the default data folder).
+pub fn memory(a: &mut Args) -> std::sync::Arc<Memory> {
+    match a.opt(&["--data"]) {
+        Some(d) => Memory::open(Path::new(&d)),
+        None => Memory::open_default(),
+    }
+}
+
 pub fn cmd_code(mut a: Args) {
     let cfg = config(&mut a);
     let json = a.flag("--json");
     let flat = a.flag("--flat");
+    let why = a.flag("--why");
+    let baseline = a.flag("--baseline");
     let limit = a.num(&["--limit", "-n"], 20usize);
     let recent = a.opt(&["--recent"]);
+    let pick: Option<usize> = a.opt(&["--pick"]).map(|v| v.parse().unwrap_or_else(|_| die("--pick needs a result number (1 = first)")));
+    let action = a.opt(&["--action"]).unwrap_or_else(|| "open".into());
+    let mem = memory(&mut a);
     let live = open(&mut a, &cfg);
-    let mut sess = CodeSession::new(live.clone());
+    let ranker = if baseline { Ranker::baseline() } else { Ranker::new(Some(mem.clone())) };
+    let mut sess = CodeSession::with_ranker(live.clone(), ranker);
     let text = a.rest().join(" ");
     let mut cq = CodeQuery::parse(&text);
     cq.limit = limit;
@@ -147,23 +161,85 @@ pub fn cmd_code(mut a: Args) {
         }
     }
     .unwrap_or_else(|e| die(e));
+    if let Some(n) = pick {
+        // Record result #n (rank order) and print its path, e.g. `cursor -g $(flashfind code --pick 1 router)`.
+        let h = r.hits.get(n.saturating_sub(1)).unwrap_or_else(|| die(format!("no result #{n}")));
+        mem.record_pick(&cq.text, &h.path, &action, "cli");
+        match cq.line {
+            Some(l) => println!("{}:{}{}", h.path, l, cq.col.map(|c| format!(":{c}")).unwrap_or_default()),
+            None => println!("{}", h.path),
+        }
+        return;
+    }
     if json {
         println!("{}", flashfind_code::result_json(&r));
         return;
     }
     if flat {
-        for h in &r.hits {
-            println!("{}", h.path);
+        for (i, h) in r.hits.iter().enumerate() {
+            if why && !h.why.is_empty() {
+                println!("{:>2} {}    [{} · {}]", i + 1, h.path, h.score, h.why);
+            } else if why {
+                println!("{:>2} {}    [{}]", i + 1, h.path, h.score);
+            } else {
+                println!("{}", h.path);
+            }
         }
     } else {
         for g in &r.groups {
             println!("{}  ({}, {})", g.repo, g.root, ago(g.active));
             for &i in &g.hits {
-                println!("    {}", r.hits[i].rel);
+                let h = &r.hits[i];
+                if why {
+                    let w = if h.why.is_empty() { String::new() } else { format!(" · {}", h.why) };
+                    println!("    {}    [{}{}]", h.rel, h.score, w);
+                } else {
+                    println!("    {}", h.rel);
+                }
             }
         }
     }
     eprintln!("{} matches in {} µs", r.total, r.elapsed_us);
+}
+
+/// `flashfind pick <path> [--query Q] [--action A]`: tell flashfind which
+/// file you meant (editors, scripts). `--forget` clears the memory,
+/// `--show` prints it.
+pub fn cmd_pick(mut a: Args) {
+    let query = a.opt(&["--query", "-q"]).unwrap_or_default();
+    let action = a.opt(&["--action"]).unwrap_or_else(|| "open".into());
+    let forget = a.flag("--forget");
+    let show = a.flag("--show");
+    let mem = memory(&mut a);
+    if forget {
+        mem.forget();
+        eprintln!("flashfind: memory cleared ({})", mem.path().map_or("in memory".into(), |p| p.display().to_string()));
+        return;
+    }
+    if show {
+        let r = mem.recall();
+        println!("memory: {} events in {}", mem.len(), mem.path().map_or("-".into(), |p| p.display().to_string()));
+        println!("most frecent:");
+        for (p, f) in r.top_frecent(15) {
+            println!("  {f:6.2}  {p}");
+        }
+        println!("queries:");
+        let mut qs: Vec<_> = r.queries.iter().collect();
+        qs.sort_by(|a, b| a.0.cmp(b.0));
+        for (q, files) in qs.iter().take(50) {
+            let f: Vec<String> = files.iter().map(|(p, c, n)| format!("{} ({n}×, {c:.2})", p)).collect();
+            println!("  {q:20} → {}", f.join(", "));
+        }
+        return;
+    }
+    let rest = a.rest();
+    if rest.is_empty() {
+        die("pick needs a path (or --show / --forget)");
+    }
+    for p in rest {
+        let abs = std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(&p));
+        mem.record_pick(&query, &abs.to_string_lossy(), &action, "cli");
+    }
 }
 
 pub fn cmd_mcp(mut a: Args) {
@@ -180,7 +256,7 @@ pub fn cmd_mcp(mut a: Args) {
 
 // ------------------------------------------------------------ synthetic
 
-const W: &[&str] = &[
+pub(crate) const W: &[&str] = &[
     "auth",
     "router",
     "parser",

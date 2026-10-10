@@ -5,7 +5,7 @@
 //! Results are compact JSON grouped by repo (repo root once, paths relative
 //! to it) to keep agent context small.
 
-use crate::{CodeIndex, CodeLive, CodeQuery, CodeSession, Config, projects_json, result_json};
+use crate::{CodeIndex, CodeLive, CodeQuery, CodeSession, Config, Memory, Ranker, projects_json, result_json};
 use flashfind_core::CancelToken;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
@@ -16,6 +16,7 @@ use std::time::Duration;
 pub struct Server {
     live: Arc<CodeLive>,
     sess: Mutex<CodeSession>,
+    memory: Option<Arc<Memory>>,
 }
 
 fn tools() -> Value {
@@ -60,6 +61,18 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "record_pick",
+            "description": "Tell flashfind which file you actually used for a query (after find_files), so the next search for that query ranks it first. Cheap; call it when the file you opened was not the first result.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The find_files query you searched with."},
+                    "path": {"type": "string", "description": "Absolute path (or repo root + relative path) of the file you used."}
+                },
+                "required": ["path"]
+            }
+        },
+        {
             "name": "reindex",
             "description": "Rediscover projects and rebuild the index now (normally unnecessary: the index follows file changes live).",
             "inputSchema": {"type": "object", "properties": {}}
@@ -99,9 +112,19 @@ impl Server {
     }
 
     pub fn with_live(live: Arc<CodeLive>) -> Server {
+        Server::with_memory(live, Some(Memory::open_default()))
+    }
+
+    /// `memory: None` = no learning (tests).
+    pub fn with_memory(live: Arc<CodeLive>, memory: Option<Arc<Memory>>) -> Server {
+        let sess = match &memory {
+            Some(m) => CodeSession::with_ranker(live.clone(), Ranker::new(Some(m.clone()))),
+            None => CodeSession::new(live.clone()),
+        };
         Server {
-            sess: Mutex::new(CodeSession::new(live.clone())),
+            sess: Mutex::new(sess),
             live,
+            memory,
         }
     }
 
@@ -110,7 +133,7 @@ impl Server {
             roots: ci.roots.clone(),
             ..Config::default()
         };
-        Server::with_live(CodeLive::from_index(cfg, ci))
+        Server::with_memory(CodeLive::from_index(cfg, ci), None)
     }
 
     fn call(&self, name: &str, a: &Value) -> Result<Value, String> {
@@ -153,6 +176,13 @@ impl Server {
                 };
                 let r = self.sess.lock().unwrap().recent(&cq, within)?;
                 Ok(result_json(&r))
+            }
+            "record_pick" => {
+                let path = s("path").ok_or("path is required")?;
+                let abs = std::fs::canonicalize(&path).map_err(|e| format!("{path}: {e}"))?;
+                let m = self.memory.as_ref().ok_or("memory is disabled")?;
+                m.record_pick(&s("query").unwrap_or_default(), &abs.to_string_lossy(), "read", "mcp");
+                Ok(json!({"ok": true}))
             }
             "reindex" => {
                 let t = std::time::Instant::now();

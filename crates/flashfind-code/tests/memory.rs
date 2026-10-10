@@ -1,0 +1,127 @@
+use flashfind_code::memory::{Memory, norm_query, strip_line_suffix};
+use flashfind_code::*;
+use flashfind_core::CancelToken;
+use std::path::{Path, PathBuf};
+
+fn tmpdir(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("flashfind-mem-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::canonicalize(&p).unwrap()
+}
+
+fn put(root: &Path, rel: &str) {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, "x").unwrap();
+}
+
+fn fake_repo(root: &Path, rel: &str, files: &[&str]) {
+    put(root, &format!("{rel}/.git/HEAD"));
+    std::fs::write(root.join(rel).join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    for f in files {
+        put(root, &format!("{rel}/{f}"));
+    }
+}
+
+/// 30 repos that all have README.md and src/router.ts.
+fn many(tag: &str) -> (PathBuf, std::sync::Arc<CodeLive>) {
+    let home = tmpdir(tag);
+    for i in 0..30 {
+        fake_repo(&home, &format!("dev/repo{i:02}"), &["README.md", "src/router.ts", "src/reporter.ts"]);
+    }
+    let cfg = Config {
+        roots: vec![home.clone()],
+        threads: 2,
+        ..Config::default()
+    };
+    let live = CodeLive::from_index(cfg.clone(), CodeIndex::build(&cfg));
+    (home, live)
+}
+
+fn top(sess: &mut CodeSession, q: &str) -> Vec<String> {
+    let mut cq = CodeQuery::parse(q);
+    cq.limit = 10;
+    sess.search(&cq, &CancelToken::new()).unwrap().hits.iter().map(|h| h.path.clone()).collect()
+}
+
+#[test]
+fn norm_and_line_suffix() {
+    assert_eq!(norm_query("  Auth   Middleware.ts:12 "), "auth middleware.ts");
+    assert_eq!(strip_line_suffix("main.rs:12:3"), ("main.rs", Some(12), Some(3)));
+    assert_eq!(strip_line_suffix("main.rs:12"), ("main.rs", Some(12), None));
+    assert_eq!(strip_line_suffix("main.rs"), ("main.rs", None, None));
+    assert_eq!(strip_line_suffix(":12"), (":12", None, None));
+    let q = CodeQuery::parse("repo:x router.ts:40");
+    assert_eq!((q.text.as_str(), q.line), ("router.ts", Some(40)));
+    let q = CodeQuery::parse("limit:5 router");
+    assert_eq!((q.text.as_str(), q.line), ("limit:5 router", None));
+}
+
+#[test]
+fn strengths_learn_from_first_pick_and_prefixes() {
+    let m = Memory::in_memory();
+    m.record_pick("auth", "/a/auth.ts", "open", "test");
+    let r = m.recall();
+    let s = r.query_strengths("auth");
+    assert!((s["/a/auth.ts"] - 0.632).abs() < 0.01, "{s:?}");
+    // Still typing: a prefix of a remembered query.
+    assert!(r.query_strengths("aut")["/a/auth.ts"] > 0.5);
+    // Refining: the remembered query is a prefix of what is typed.
+    assert!(r.query_strengths("auth midd")["/a/auth.ts"] > 0.3);
+    // Unrelated / too short.
+    assert!(r.query_strengths("rout").is_empty());
+    assert!(r.query_strengths("a").is_empty());
+    m.record_pick("auth", "/a/auth.ts", "open", "test");
+    m.record_pick("auth", "/a/auth.ts", "open", "test");
+    assert!(m.recall().query_strengths("auth")["/a/auth.ts"] > 0.94);
+}
+
+#[test]
+fn persisted_and_shared_between_instances() {
+    let d = tmpdir("persist");
+    let a = Memory::open(&d);
+    let b = Memory::open(&d);
+    a.record_pick("readme", "/x/README.md", "open", "test");
+    assert_eq!(b.len(), 1, "other instance sees the append");
+    assert!(b.recall().query_strengths("readme").contains_key("/x/README.md"));
+    assert!(a.record_touch("/x/main.rs"));
+    assert!(!b.record_touch("/x/main.rs"), "cooldown is shared");
+    b.forget();
+    assert_eq!(a.len(), 0);
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_pick_wins_the_next_search_even_far_down_the_list() {
+    let (home, live) = many("pick");
+    let m = Memory::in_memory();
+    let mut sess = CodeSession::with_ranker(live.clone(), Ranker::new(Some(m.clone())));
+    let before = top(&mut sess, "readme");
+    let want = home.join("dev/repo27/README.md").to_string_lossy().into_owned();
+    assert_ne!(before[0], want);
+    m.record_pick("readme", &want, "open", "test");
+    assert_eq!(top(&mut sess, "readme")[0], want, "learned from one pick");
+    assert_eq!(top(&mut sess, "readm")[0], want, "prefix of the remembered query");
+    // Baseline ranking ignores memory.
+    let mut base = CodeSession::with_ranker(live.clone(), Ranker::baseline());
+    assert_eq!(top(&mut base, "readme"), before);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn weak_matches_cannot_ride_memory_past_strong_ones() {
+    let (home, live) = many("weak");
+    let m = Memory::in_memory();
+    let mut sess = CodeSession::with_ranker(live.clone(), Ranker::new(Some(m.clone())));
+    // `reporter.ts` is only a fuzzy match for "router"; picking it 5× must not
+    // beat exact `router.ts` matches.
+    let weak = home.join("dev/repo03/src/reporter.ts").to_string_lossy().into_owned();
+    for _ in 0..5 {
+        m.record_pick("router", &weak, "open", "test");
+    }
+    let t = top(&mut sess, "router");
+    assert!(t[0].ends_with("router.ts"), "{t:?}");
+    assert_eq!(rank::apply(545, 60.0), 872);
+    let _ = std::fs::remove_dir_all(home);
+}

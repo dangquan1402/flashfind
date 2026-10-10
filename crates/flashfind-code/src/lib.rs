@@ -13,8 +13,12 @@
 
 pub mod live;
 pub mod mcp;
+pub mod memory;
+pub mod rank;
 
 pub use live::{CodeLive, CodeSession, LiveStats};
+pub use memory::{Memory, Recall};
+pub use rank::{Features, RankInput, Ranker};
 
 use flashfind_core::walk::{KIND_DIR, KIND_FILE, KIND_LINK, KIND_MASK, KIND_OTHER, Listing};
 use flashfind_core::{CancelToken, Index, Query, Session};
@@ -611,6 +615,9 @@ pub struct CodeHit {
     pub kind: &'static str,
     pub size: u64,
     pub mtime: i64,
+    /// Why personal ranking moved it (e.g. "picked before"); empty if not.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub why: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -639,7 +646,12 @@ pub struct CodeQuery {
     pub langs: Vec<String>,
     pub dirty: bool,
     pub limit: usize,
+    /// `file.rs:12[:3]` at the end of the query: jump target.
+    pub line: Option<u32>,
+    pub col: Option<u32>,
 }
+
+const FILTER_KEYS: &[&str] = &["ext", "type", "size", "mtime", "in", "limit", "repo", "project", "lang", "dirty"];
 
 /// `lang:` → extensions.
 pub fn lang_exts(lang: &str) -> Option<&'static [&'static str]> {
@@ -698,6 +710,14 @@ impl CodeQuery {
                 q.dirty = true;
             } else {
                 rest.push(w);
+            }
+        }
+        if let Some(last) = rest.last_mut() {
+            let (base, line, col) = memory::strip_line_suffix(last);
+            if line.is_some() && !FILTER_KEYS.contains(&base.to_ascii_lowercase().as_str()) && !base.contains(':') {
+                *last = base;
+                q.line = line;
+                q.col = col;
             }
         }
         q.text = rest.join(" ");
@@ -1024,6 +1044,7 @@ impl CodeIndex {
             kind: kind_name(self.idx.ent_kind()[e as usize]),
             size: self.idx.size(e),
             mtime: self.idx.mtime(e),
+            why: String::new(),
         })
     }
 
@@ -1034,6 +1055,11 @@ impl CodeIndex {
 
     /// [`CodeIndex::search`] with extra excluded entries (live tombstones).
     pub fn search_with(&self, sess: &mut Session, cq: &CodeQuery, cancel: &CancelToken, extra: Option<&[u64]>) -> Result<CodeResult, String> {
+        self.search_ranked(sess, cq, cancel, extra, &RankInput::legacy())
+    }
+
+    /// Search with personal ranking (see [`rank`]).
+    pub fn search_ranked(&self, sess: &mut Session, cq: &CodeQuery, cancel: &CancelToken, extra: Option<&[u64]>, rk: &RankInput) -> Result<CodeResult, String> {
         // Only filters (e.g. `repo:x`, `dirty:`): list matching files, newest first.
         if cq.text.trim().is_empty() {
             return self.recent_with(cq, None, extra);
@@ -1045,17 +1071,45 @@ impl CodeIndex {
             q.exts.extend(exts.iter().map(|e| e.as_bytes().to_vec()));
         }
         let limit = cq.limit.max(1);
-        // Fetch extra so the recency boost can reorder within score bands.
+        // Fetch extra so personal boosts can reorder.
         q.limit = (limit * 3).max(30);
         let mask = self.mask(cq, extra)?;
         let r = sess.search_masked(&q, cancel, Some(&mask)).map_err(|e| e.to_string())?;
+        let mut raw: Vec<(u32, i32)> = r.hits.iter().map(|h| (h.entry, h.score)).collect();
+        // Remembered files the matcher would not fetch: score just those.
+        let cands = rk.candidates();
+        if !cands.is_empty() {
+            let mut allow = vec![!0u64; mask.len()];
+            let mut n = 0;
+            for p in &cands {
+                if let Some(e) = self.idx.lookup(p.as_bytes()) {
+                    allow[e as usize >> 6] &= !(1 << (e & 63));
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                for (a, m) in allow.iter_mut().zip(&mask) {
+                    *a |= m;
+                }
+                let mut q2 = q.clone();
+                q2.limit = n;
+                let r2 = sess.search_masked(&q2, cancel, Some(&allow)).map_err(|e| e.to_string())?;
+                raw.extend(r2.hits.iter().map(|h| (h.entry, h.score)));
+            }
+        }
+        raw.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        raw.dedup_by_key(|x| x.0);
         let t = now();
-        let mut hits: Vec<CodeHit> = r
-            .hits
+        let mut hits: Vec<CodeHit> = raw
             .iter()
-            .filter_map(|h| self.hit(h.entry, h.score))
+            .filter_map(|&(e, s)| self.hit(e, s))
             .map(|mut h| {
-                h.score += recency_boost(t - self.repos[h.repo].active);
+                if rk.features.legacy_repo_recency {
+                    h.score += recency_boost(t - self.repos[h.repo].active);
+                }
+                let (pct, why) = rk.boost(&h.path);
+                h.score = rank::apply(h.score, pct);
+                h.why = why.join(", ");
                 h
             })
             .collect();

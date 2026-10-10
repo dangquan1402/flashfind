@@ -1,6 +1,7 @@
 //! `flashfind` – index, search, benchmark.
 
 mod bench;
+mod bench_ux;
 mod code;
 mod report;
 mod treegen;
@@ -16,12 +17,17 @@ const USAGE: &str = "flashfind – find anything across all your code projects (
 
 USAGE (code projects):
   flashfind projects [--root DIR]... [--json] [--refresh] [filter]
-  flashfind code [--root DIR]... [--json] [--flat] [--limit N] [--recent 7d] [--refresh] <query...>
-        query adds repo:<name>  lang:<rust|ts|py|go|swift|...>  dirty:  to the syntax below
+  flashfind code [--root DIR]... [--json] [--flat] [--why] [--limit N] [--recent 7d] [--refresh] <query...>
+        query adds repo:<name>  lang:<rust|ts|py|go|swift|...>  dirty:  and a file:LINE suffix to the syntax below
+        --pick N        record result N as the file you meant and print its path (`cursor -g $(flashfind code --pick 1 q)`)
+        --why           show scores and why personal ranking moved a result;  --baseline: 0.1 ranking
+  flashfind pick <path>... [--query Q] [--action open|copy|reveal|cursor]   remember a pick (learned ranking)
+  flashfind pick --show | --forget          inspect / clear the memory ($FLASHFIND_DATA or ~/.local/share/flashfind)
   flashfind mcp [--root DIR]... [--max-age SECS]      MCP server on stdio (find_files, list_projects, recent_files)
   flashfind gen-repos --root DIR --repos N [--seed S] --queries FILE
   flashfind bench-code --root DIR --queries FILE [--out JSON --md MD]
   flashfind bench-live-code --dir DIR-IN-A-REPO [-n N]   change-to-searchable latency (temp files, cleaned up)
+  flashfind bench-ux [--real] [--seed S] [--md FILE]    replay a pick history: right-file-first, keystrokes-to-open per ranking variant
   flashfind bench-vs --root DIR [--label NAME] ...       live terminal race vs fff and fsearch (bench/vs, built separately)
   Roots default to $FLASHFIND_CODE_ROOTS or ~ (Library, media and hidden folders skipped);
   the code index is cached in $FLASHFIND_CACHE or ~/.cache/flashfind and follows changes live
@@ -122,11 +128,13 @@ fn main() {
         "watch" => cmd_watch(a),
         "projects" => code::cmd_projects(a),
         "code" | "c" => code::cmd_code(a),
+        "pick" => code::cmd_pick(a),
         "mcp" => code::cmd_mcp(a),
         "gen-repos" => code::cmd_gen_repos(a),
         "bench-code" => code::cmd_bench_code(a),
         "bench-live-code" => code::cmd_bench_live_code(a),
         "bench-vs" => bench_vs(),
+        "bench-ux" => bench_ux::cmd_bench_ux(a),
         "report" => report::run(a),
         "help" | "-h" | "--help" => {
             if a.rest().first().map(String::as_str) == Some("query") {

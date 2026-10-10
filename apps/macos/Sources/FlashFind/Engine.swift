@@ -12,6 +12,8 @@ struct Hit: Hashable {
     let group: Int
     let isDir: Bool
     let repoActive: Int64
+    /// Why personal ranking moved it ("picked before", "dirty", …).
+    var why: String = ""
 }
 
 struct SearchResult {
@@ -57,7 +59,7 @@ private let codePageCallback: ff_code_page_cb = { ctx, page in
         let h = p.hits[i]
         hits.append(Hit(path: String(cString: h.path), rel: String(cString: h.rel), repo: String(cString: h.repo),
                         repoRoot: String(cString: h.repo_root), group: Int(h.group), isDir: h.kind == 1,
-                        repoActive: h.repo_active))
+                        repoActive: h.repo_active, why: h.why.map { String(cString: $0) } ?? ""))
     }
     box.r.hits = hits
 }
@@ -108,6 +110,11 @@ final class CodeEngine: @unchecked Sendable {
         var s = ff_code_stats()
         ff_code_get_stats(code, &s)
         return s
+    }
+
+    /// Learned ranking: remember the file meant for `query`.
+    func recordPick(query: String, path: String, action: String) {
+        _ = query.withCString { q in path.withCString { p in action.withCString { a in ff_code_record_pick(code, q, p, a) } } }
     }
 
     /// nil when cancelled. Call from one worker queue (the session is serial).

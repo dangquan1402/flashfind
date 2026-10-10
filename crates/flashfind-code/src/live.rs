@@ -19,7 +19,7 @@
 //!   restart (or a one-shot CLI run, see [`CodeLive::replay`]) replays only
 //!   newer events.
 
-use crate::{CodeHit, CodeIndex, CodeQuery, CodeResult, Config, DISCOVERY_SKIP, Repo, git_dir, group, repo_info};
+use crate::{CodeHit, CodeIndex, CodeQuery, CodeResult, Config, DISCOVERY_SKIP, RankInput, Ranker, Repo, git_dir, group, repo_info};
 use flashfind_core::watch::{self, HISTORY_DONE, LOSSY};
 use flashfind_core::{CancelToken, Session};
 use std::collections::BTreeSet;
@@ -598,6 +598,7 @@ pub struct CodeSession {
     live: Arc<CodeLive>,
     base: Option<(usize, Session)>,
     over: Vec<(usize, Session)>,
+    ranker: Option<Ranker>,
 }
 
 fn not_found(e: &str) -> bool {
@@ -610,7 +611,23 @@ impl CodeSession {
             live,
             base: None,
             over: Vec::new(),
+            ranker: None,
         }
+    }
+
+    /// A session with personal ranking ([`Ranker`]).
+    pub fn with_ranker(live: Arc<CodeLive>, ranker: Ranker) -> CodeSession {
+        let mut s = CodeSession::new(live);
+        s.ranker = Some(ranker);
+        s
+    }
+
+    pub fn ranker(&self) -> Option<&Ranker> {
+        self.ranker.as_ref()
+    }
+
+    pub fn set_ranker(&mut self, r: Option<Ranker>) {
+        self.ranker = r;
     }
 
     pub fn live(&self) -> &Arc<CodeLive> {
@@ -667,7 +684,11 @@ impl CodeSession {
     }
 
     pub fn search(&mut self, cq: &CodeQuery, cancel: &CancelToken) -> Result<CodeResult, String> {
-        self.run(cq, &mut |ci, s, extra| ci.search_with(s, cq, cancel, extra))
+        let rk = match &self.ranker {
+            Some(r) => r.input(&cq.text),
+            None => RankInput::legacy(),
+        };
+        self.run(cq, &mut |ci, s, extra| ci.search_ranked(s, cq, cancel, extra, &rk))
     }
 
     pub fn recent(&mut self, cq: &CodeQuery, within: Option<i64>) -> Result<CodeResult, String> {

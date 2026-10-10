@@ -121,6 +121,7 @@ typedef struct {
     uint64_t size;
     int64_t mtime;
     int64_t repo_active;    /* repo's last activity, Unix seconds */
+    const char *why;        /* why personal ranking moved it ("picked before", ...), "" if not */
 } ff_code_hit;
 
 typedef struct {
@@ -150,6 +151,10 @@ void ff_code_get_stats(const ff_code *c, ff_code_stats *out);
 char *ff_code_projects_json(const ff_code *c, const char *filter, uint32_t limit); /* ff_string_free */
 void ff_code_checkpoint(const ff_code *c);
 void ff_code_free(ff_code *c);
+/* Learned ranking: remember that `path` was the file meant for `query`
+   (action: "open", "copy", "reveal", "cursor"). Stored in $FLASHFIND_DATA
+   or ~/.local/share/flashfind/memory.jsonl, shared with the CLI and MCP. */
+int32_t ff_code_record_pick(const ff_code *c, const char *query, const char *path, const char *action);
 ff_code_session *ff_code_session_new(const ff_code *c);
 void ff_code_session_free(ff_code_session *s);
 /* Query language + repo:/lang:/dirty:. Filters only => files newest first.

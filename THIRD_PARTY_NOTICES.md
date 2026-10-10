@@ -4,7 +4,9 @@
 
 Parts of `crates/flashfind-core/src/walk/macos.rs` (the `getattrlistbulk(2)`
 crawler: attribute layout parsing, `openat` fan-out, `setiopolicy_np`
-no-materialize policy) and the file-type extension table in
+no-materialize policy), the FSEvents binding in
+`crates/flashfind-core/src/watch.rs` (adapted from fsearch `src/fsevents.rs`),
+and the file-type extension table in
 `crates/flashfind-core/src/query.rs` are adapted from
 [fsearch](https://github.com/noahdunnagan/fsearch). Several design ideas
 (interned names with a character-class mask, name → entries inverted list,

@@ -104,8 +104,9 @@ fn multi_token_matches_ancestors() {
     );
     let r = top(&idx, "alpha notes");
     assert_eq!(r.len(), 2, "{r:?}");
-    assert_eq!(r[0], "projects/alpha_notes.md");
-    assert!(r.contains(&"projects/alpha/notes.md".to_string()));
+    // Folder + exact name beats both words squeezed into one longer name.
+    assert_eq!(r[0], "projects/alpha/notes.md");
+    assert!(r.contains(&"projects/alpha_notes.md".to_string()));
     // Exact stem under a matching folder beats a word match in a longer name.
     assert_eq!(top(&idx, "projects/notes"), vec!["projects/alpha/notes.md", "projects/alpha_notes.md"]);
 }

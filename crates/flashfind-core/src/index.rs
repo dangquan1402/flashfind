@@ -20,34 +20,60 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FFIDX004";
+const MAGIC: &[u8; 8] = b"FFIDX005";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 enum S {
     NameLower,
-    NameOrig,
     NameOff,
     NameMask,
-    NameSorted,
-    NameEntOff,
-    NameEnts,
+    NameSig,
+    NameEnt,
+    NameMulti,
+    UpperBits,
+    UpperRank,
+    OrigOff,
+    NameOrig,
     EntName,
     EntParent,
     EntKind,
     EntPrior,
     EntSize,
     EntMtime,
-    EntEnd,
     DirEntry,
+    DirEnd,
     Root,
-    NameBigram,
-    SortedLen,
-    SortedStem,
 }
 const NSECT: usize = 19;
-/// Header: magic + [n, u, d, created] + NSECT × (offset, len) in u64 words.
-const HDR_WORDS: usize = 1 + 4 + NSECT * 2;
+/// Element size of each section (validation on load).
+const SIZES: [usize; NSECT] = [1, 4, 8, 8, 4, 4, 8, 4, 4, 1, 4, 4, 1, 1, 4, 4, 4, 4, 1];
+/// Header: magic + [n, u, d, created, event_id, reserved] + NSECT × (offset, len) in u64 words.
+const HDR_WORDS: usize = 1 + 6 + NSECT * 2;
+/// `name_ent` tag: the low 31 bits index `name_multi` instead of being the entry.
+const MULTI: u32 = 1 << 31;
+
+/// Sizes are stored in 32 bits: exact below 2 GiB, MiB granularity above
+/// (up to 2 PiB). Size filters on files over 2 GiB are therefore rounded
+/// down to the MiB.
+#[inline(always)]
+pub fn enc_size(s: u64) -> u32 {
+    if s < 1 << 31 {
+        s as u32
+    } else {
+        (1 << 31) | (s >> 20).min((1 << 31) - 1) as u32
+    }
+}
+#[inline(always)]
+pub fn dec_size(v: u32) -> u64 {
+    if v >> 31 == 0 { v as u64 } else { ((v & 0x7fff_ffff) as u64) << 20 }
+}
+/// Mtimes are stored as unsigned 32-bit Unix seconds (1970 – 2106);
+/// pre-1970 times clamp to 0. Query arithmetic stays 64-bit.
+#[inline(always)]
+pub fn enc_mtime(t: i64) -> u32 {
+    t.clamp(0, u32::MAX as i64) as u32
+}
 
 enum Buf {
     Owned(Vec<u64>),
@@ -70,8 +96,10 @@ pub struct Index {
     pub n: usize,
     pub u: usize,
     pub d: usize,
-    /// Unix time the crawl finished.
+    /// Unix time the crawl started.
     pub created: i64,
+    /// FSEvents event id (macOS) the index is current up to; 0 = unknown.
+    pub event_id: u64,
 }
 
 /// Plain-old-data element types allowed in sections.
@@ -93,7 +121,7 @@ pub struct BuildStats {
 }
 
 #[derive(Default)]
-struct Fx(u64);
+pub(crate) struct Fx(u64);
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
         self.0
@@ -167,6 +195,21 @@ fn own_penalty(folded: &[u8], kind: u8, depth: u32, root_is_slash: bool) -> (i32
     (own, inherit)
 }
 
+/// Prior of one entry and the penalty its subtree inherits, from its raw
+/// name, kind, depth (1 = child of the root) and the inherited penalty.
+/// Shared by the index builder and the live overlay.
+pub(crate) fn entry_prior(name: &[u8], kind: u8, depth: u32, inherited: i32, root_is_slash: bool) -> (i8, i32) {
+    let (own, sub) = if kind & KIND_MASK == KIND_DIR {
+        let folded: Vec<u8> = name.iter().map(|&b| fold(b)).collect();
+        own_penalty(&folded, kind, depth, root_is_slash)
+    } else {
+        // Files: only the hidden test applies (no allocation on the hot path).
+        own_penalty(&name[..name.len().min(1)], kind, depth, root_is_slash)
+    };
+    let prior = (own + inherited - (depth.saturating_sub(1) as i32).min(15)).clamp(-50, 40);
+    (prior as i8, (inherited + sub).max(-60))
+}
+
 struct Builder {
     words: Vec<u64>,
     sect: [(usize, usize); NSECT],
@@ -192,11 +235,10 @@ impl Index {
         unsafe { std::slice::from_raw_parts(b.as_ptr().add(off) as *const T, len) }
     }
 
+    /// Folded (ASCII-lowercase) name bytes; names are numbered in sorted
+    /// folded order, so this arena is itself sorted.
     pub fn name_lower(&self) -> &[u8] {
         self.get(S::NameLower)
-    }
-    pub fn name_orig(&self) -> &[u8] {
-        self.get(S::NameOrig)
     }
     pub fn name_off(&self) -> &[u32] {
         self.get(S::NameOff)
@@ -204,35 +246,13 @@ impl Index {
     pub fn name_mask(&self) -> &[u64] {
         self.get(S::NameMask)
     }
-    /// Name ids in lexicographic (folded) order.
-    /// Name length, in `name_sorted` order (sequential prefix scoring).
-    pub fn sorted_len(&self) -> &[u16] {
-        self.get(S::SortedLen)
-    }
-    /// Stem length (bytes before the last `.`, or the full length), in
-    /// `name_sorted` order.
-    pub fn sorted_stem(&self) -> &[u16] {
-        self.get(S::SortedStem)
-    }
     /// Hashed bigram signature per name (typo prefilter).
-    pub fn name_bigram(&self) -> &[u64] {
-        self.get(S::NameBigram)
+    pub fn name_sig(&self) -> &[u64] {
+        self.get(S::NameSig)
     }
-    /// Bigram signature of name id `id`.
     #[inline(always)]
     pub fn sig(&self, id: u32) -> crate::matcher::Sig {
-        let b = self.name_bigram();
-        let i = id as usize * 2;
-        (b[i] as u128) | ((b[i + 1] as u128) << 64)
-    }
-    pub fn name_sorted(&self) -> &[u32] {
-        self.get(S::NameSorted)
-    }
-    pub fn name_ent_off(&self) -> &[u32] {
-        self.get(S::NameEntOff)
-    }
-    pub fn name_ents(&self) -> &[u32] {
-        self.get(S::NameEnts)
+        self.name_sig()[id as usize]
     }
     pub fn ent_name(&self) -> &[u32] {
         self.get(S::EntName)
@@ -247,22 +267,52 @@ impl Index {
     pub fn ent_prior(&self) -> &[i8] {
         self.get(S::EntPrior)
     }
-    pub fn ent_size(&self) -> &[u64] {
+    /// Encoded sizes (see [`dec_size`]).
+    pub fn ent_size_raw(&self) -> &[u32] {
         self.get(S::EntSize)
     }
-    pub fn ent_mtime(&self) -> &[i64] {
+    /// Mtimes as u32 Unix seconds (see [`enc_mtime`]).
+    pub fn ent_mtime_raw(&self) -> &[u32] {
         self.get(S::EntMtime)
     }
-    /// Exclusive end of each entry's subtree.
-    pub fn ent_end(&self) -> &[u32] {
-        self.get(S::EntEnd)
+    #[inline]
+    pub fn size(&self, e: u32) -> u64 {
+        dec_size(self.ent_size_raw()[e as usize])
     }
-    /// Directory id → entry.
+    #[inline]
+    pub fn mtime(&self, e: u32) -> i64 {
+        self.ent_mtime_raw()[e as usize] as i64
+    }
+    /// Directory id → entry (ascending: directories are numbered in DFS order).
     pub fn dir_entry(&self) -> &[u32] {
         self.get(S::DirEntry)
     }
+    /// Directory id → exclusive end of its subtree.
+    pub fn dir_end(&self) -> &[u32] {
+        self.get(S::DirEnd)
+    }
     pub fn root(&self) -> &[u8] {
         self.get(S::Root)
+    }
+
+    /// Directory id of entry `e`, if it is a directory.
+    #[inline]
+    pub fn dir_id(&self, e: u32) -> Option<u32> {
+        if self.ent_kind()[e as usize] & KIND_MASK != KIND_DIR {
+            return None;
+        }
+        let de = self.dir_entry();
+        let i = de.partition_point(|&x| x < e);
+        (i < de.len() && de[i] == e).then_some(i as u32)
+    }
+
+    /// Exclusive end of entry `e`'s subtree (`e + 1` for non-directories).
+    #[inline]
+    pub fn end(&self, e: u32) -> u32 {
+        match self.dir_id(e) {
+            Some(d) => self.dir_end()[d as usize],
+            None => e + 1,
+        }
     }
 
     /// Folded bytes of name id `id`.
@@ -271,20 +321,70 @@ impl Index {
         let o = self.name_off();
         &self.name_lower()[o[id as usize] as usize..o[id as usize + 1] as usize]
     }
+    /// Original-case bytes of name id `id`. Only names containing an ASCII
+    /// capital store a second copy; the rest are their folded form.
     #[inline(always)]
     pub fn orig(&self, id: u32) -> &[u8] {
-        let o = self.name_off();
-        &self.name_orig()[o[id as usize] as usize..o[id as usize + 1] as usize]
+        let bits: &[u64] = self.get(S::UpperBits);
+        let (w, b) = ((id >> 6) as usize, 1u64 << (id & 63));
+        if bits[w] & b == 0 {
+            return self.lower(id);
+        }
+        let rank: &[u32] = self.get(S::UpperRank);
+        let r = (rank[w] + (bits[w] & (b - 1)).count_ones()) as usize;
+        let o: &[u32] = self.get(S::OrigOff);
+        &self.get::<u8>(S::NameOrig)[o[r] as usize..o[r + 1] as usize]
     }
     /// Entries carrying name id `id`, ascending.
     #[inline(always)]
     pub fn entries_of(&self, id: u32) -> &[u32] {
-        let o = self.name_ent_off();
-        &self.name_ents()[o[id as usize] as usize..o[id as usize + 1] as usize]
+        let v = &self.get::<u32>(S::NameEnt)[id as usize];
+        if *v & MULTI == 0 {
+            return std::slice::from_ref(v);
+        }
+        let m: &[u32] = self.get(S::NameMulti);
+        let o = (*v & !MULTI) as usize;
+        &m[o + 1..o + 1 + m[o] as usize]
+    }
+    /// Number of entries carrying name id `id`.
+    #[inline(always)]
+    pub fn count_of(&self, id: u32) -> usize {
+        let v = self.get::<u32>(S::NameEnt)[id as usize];
+        if v & MULTI == 0 {
+            1
+        } else {
+            self.get::<u32>(S::NameMulti)[(v & !MULTI) as usize] as usize
+        }
     }
 
     pub fn bytes(&self) -> usize {
         self.buf.bytes().len()
+    }
+
+    /// Bytes per section (for size reports).
+    pub fn section_sizes(&self) -> Vec<(&'static str, usize)> {
+        const NAMES: [&str; NSECT] = [
+            "name_lower",
+            "name_off",
+            "name_mask",
+            "name_sig",
+            "name_ent",
+            "name_multi",
+            "upper_bits",
+            "upper_rank",
+            "orig_off",
+            "name_orig",
+            "ent_name",
+            "ent_parent",
+            "ent_kind",
+            "ent_prior",
+            "ent_size",
+            "ent_mtime",
+            "dir_entry",
+            "dir_end",
+            "root",
+        ];
+        (0..NSECT).map(|i| (NAMES[i], self.sect[i].1 * SIZES[i])).collect()
     }
 
     /// Absolute path of entry `e` (no depth limit – fsearch truncated at 256
@@ -341,15 +441,14 @@ impl Index {
 
     /// Direct children of entry `e`.
     pub fn children(&self, e: u32) -> impl Iterator<Item = u32> + '_ {
-        let end = self.ent_end();
-        let stop = end[e as usize];
+        let stop = self.end(e);
         let mut c = e + 1;
         std::iter::from_fn(move || {
             if c >= stop {
                 return None;
             }
             let r = c;
-            c = end[c as usize];
+            c = self.end(c);
             Some(r)
         })
     }
@@ -368,15 +467,27 @@ impl Index {
         Some(e)
     }
 
+    /// Index of an empty root (used while the first crawl runs).
+    pub fn empty(root: &Path) -> Index {
+        Index::build_refs(&[], root, 0, 0)
+    }
+
     /// Build from crawler listings (listing id 0 = `root`).
     pub fn build(listings: Vec<Listing>, root: &Path, created: i64) -> Index {
+        let refs: Vec<&Listing> = listings.iter().collect();
+        Index::build_refs(&refs, root, created, 0)
+    }
+
+    /// Build from borrowed listings, recording the event id the crawl
+    /// started at (so a watcher can replay everything after it).
+    pub fn build_refs(listings: &[&Listing], root: &Path, created: i64, event_id: u64) -> Index {
         let root_b = path_bytes(root);
         let root_is_slash = root_b == b"/";
-        let mut by_id: Vec<Option<Listing>> = Vec::new();
-        for l in listings {
+        let mut by_id: Vec<Option<&Listing>> = Vec::new();
+        for &l in listings {
             let id = l.id as usize;
             if by_id.len() <= id {
-                by_id.resize_with(id + 1, || None);
+                by_id.resize(id + 1, None);
             }
             by_id[id] = Some(l);
         }
@@ -386,161 +497,189 @@ impl Index {
         let mut ent_parent: Vec<u32> = Vec::with_capacity(total);
         let mut ent_kind: Vec<u8> = Vec::with_capacity(total);
         let mut ent_prior: Vec<i8> = Vec::with_capacity(total);
-        let mut ent_size: Vec<u64> = Vec::with_capacity(total);
-        let mut ent_mtime: Vec<i64> = Vec::with_capacity(total);
-        let mut ent_end: Vec<u32> = vec![0; total];
+        let mut ent_size: Vec<u32> = Vec::with_capacity(total);
+        let mut ent_mtime: Vec<u32> = Vec::with_capacity(total);
         let mut dir_entry: Vec<u32> = Vec::new();
-        let mut intern: HashMap<&[u8], u32, BuildHasherDefault<Fx>> = HashMap::default();
+        let mut dir_end: Vec<u32> = Vec::new();
+        let mut intern: HashMap<&[u8], u32, BuildHasherDefault<Fx>> = HashMap::with_capacity_and_hasher(total, Default::default());
         let mut names: Vec<&[u8]> = Vec::new();
-        let mut id_of = |name: &'static [u8], names: &mut Vec<&'static [u8]>| -> u32 {
+        let root_name: Vec<u8> = root.file_name().map(|n| path_bytes(Path::new(n))).unwrap_or_else(|| b"/".to_vec());
+        // Names borrow from the listings (and `root_name`), which outlive
+        // every use below.
+        let mut id_of = |name: &[u8]| -> u32 {
+            // SAFETY: see above; the map and vector are dropped before return.
+            let name: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(name) };
             *intern.entry(name).or_insert_with(|| {
                 names.push(name);
                 (names.len() - 1) as u32
             })
         };
-        // SAFETY: listings live in `by_id` until the end of this function;
-        // the 'static borrow never escapes it (names are copied out below).
-        let st = |b: &[u8]| -> &'static [u8] { unsafe { std::mem::transmute::<&[u8], &'static [u8]>(b) } };
-        let root_name: Vec<u8> = root.file_name().map(|n| path_bytes(Path::new(n))).unwrap_or_else(|| b"/".to_vec());
-        let root_name_static = st(&root_name);
-        ent_name.push(id_of(root_name_static, &mut names));
+        ent_name.push(id_of(&root_name));
         ent_parent.push(NONE);
         ent_kind.push(KIND_DIR);
         ent_prior.push(0);
         ent_size.push(0);
         ent_mtime.push(0);
         dir_entry.push(0);
-        // Frame: (listing id, next child, entry of this dir, dir id, inherited penalty, depth)
-        let mut stack: Vec<(usize, usize, u32, u32, i32, u32)> = Vec::new();
+        dir_end.push(0);
+        // Frame: (listing id, next child, dir id, inherited penalty, depth)
+        let mut stack: Vec<(usize, usize, u32, i32, u32)> = Vec::new();
         if by_id.first().is_some_and(|l| l.is_some()) {
-            stack.push((0, 0, 0, 0, 0, 0));
+            stack.push((0, 0, 0, 0, 0));
         }
         while let Some(top) = stack.last_mut() {
-            let (lid, pos, dent, did, inh, depth) = *top;
-            let l = by_id[lid].as_ref().unwrap();
+            let (lid, pos, did, inh, depth) = *top;
+            let l = by_id[lid].unwrap();
             if pos >= l.ents.len() {
-                ent_end[dent as usize] = ent_name.len() as u32;
+                dir_end[did as usize] = ent_name.len() as u32;
                 stack.pop();
                 continue;
             }
             top.1 += 1;
             let raw = &l.ents[pos];
-            let name = st(l.name(raw));
+            let name = l.name(raw);
             let e = ent_name.len() as u32;
-            ent_name.push(id_of(name, &mut names));
+            ent_name.push(id_of(name));
             ent_parent.push(did);
             ent_kind.push(raw.kind);
-            ent_size.push(raw.size);
-            ent_mtime.push(raw.mtime);
-            let folded: Vec<u8> = name.iter().map(|&b| fold(b)).collect();
-            let (own, sub) = own_penalty(&folded, raw.kind, depth + 1, root_is_slash);
-            let prior = (own + inh - (depth as i32).min(15)).clamp(-50, 40);
-            ent_prior.push(prior as i8);
+            ent_size.push(enc_size(raw.size));
+            ent_mtime.push(enc_mtime(raw.mtime));
+            let (prior, sub) = entry_prior(name, raw.kind, depth + 1, inh, root_is_slash);
+            ent_prior.push(prior);
             if raw.kind & KIND_MASK == KIND_DIR {
                 let new_did = dir_entry.len() as u32;
                 dir_entry.push(e);
+                dir_end.push(e + 1);
                 let child = raw.child as usize;
                 if raw.child != NONE && child < by_id.len() && by_id[child].is_some() {
-                    stack.push((child, 0, e, new_did, (inh + sub).max(-60), depth + 1));
-                    continue;
+                    stack.push((child, 0, new_did, sub, depth + 1));
                 }
             }
-            ent_end[e as usize] = e + 1;
-        }
-        if ent_end[0] == 0 {
-            ent_end[0] = ent_name.len() as u32;
         }
         let n = ent_name.len();
-        ent_end.truncate(n);
+        if dir_end[0] == 0 {
+            dir_end[0] = n as u32;
+        }
         let u = names.len();
-        // --- Name arenas.
-        let total_bytes: usize = names.iter().map(|s| s.len()).sum();
-        let mut name_orig = Vec::with_capacity(total_bytes);
+        drop(intern);
+        // --- Number names in sorted folded order (ties: original bytes), so
+        // a prefix is a contiguous id range and `name_lower` is sorted.
+        let mut orig_tmp = Vec::with_capacity(names.iter().map(|s| s.len()).sum());
+        let mut off_tmp = Vec::with_capacity(u + 1);
+        off_tmp.push(0usize);
+        for s in &names {
+            orig_tmp.extend_from_slice(s);
+            off_tmp.push(orig_tmp.len());
+        }
+        let lower_tmp: Vec<u8> = orig_tmp.par_iter().map(|&b| fold(b)).collect();
+        let lw = |i: u32| &lower_tmp[off_tmp[i as usize]..off_tmp[i as usize + 1]];
+        let ow = |i: u32| &orig_tmp[off_tmp[i as usize]..off_tmp[i as usize + 1]];
+        let mut perm: Vec<u32> = (0..u as u32).collect();
+        perm.par_sort_unstable_by(|&a, &b| lw(a).cmp(lw(b)).then_with(|| ow(a).cmp(ow(b))));
+        let mut rank = vec![0u32; u];
+        for (r, &old) in perm.iter().enumerate() {
+            rank[old as usize] = r as u32;
+        }
+        ent_name.par_iter_mut().for_each(|id| *id = rank[*id as usize]);
+        drop(rank);
+        let mut name_lower = Vec::with_capacity(lower_tmp.len());
         let mut name_off = Vec::with_capacity(u + 1);
         name_off.push(0u32);
-        for s in &names {
-            name_orig.extend_from_slice(s);
-            name_off.push(name_orig.len() as u32);
+        let words = u.div_ceil(64).max(1);
+        let mut upper_bits = vec![0u64; words];
+        let mut upper_rank = vec![0u32; words];
+        let mut orig_off = vec![0u32];
+        let mut name_orig = Vec::new();
+        for (r, &old) in perm.iter().enumerate() {
+            let (l, o) = (lw(old), ow(old));
+            name_lower.extend_from_slice(l);
+            name_off.push(name_lower.len() as u32);
+            if l != o {
+                upper_bits[r >> 6] |= 1 << (r & 63);
+                name_orig.extend_from_slice(o);
+                orig_off.push(name_orig.len() as u32);
+            }
         }
-        let name_lower: Vec<u8> = name_orig.par_iter().map(|&b| fold(b)).collect();
+        let mut acc = 0u32;
+        for w in 0..words {
+            upper_rank[w] = acc;
+            acc += upper_bits[w].count_ones();
+        }
+        drop(names);
+        drop(perm);
+        drop(orig_tmp);
+        drop(lower_tmp);
         let name_mask: Vec<u64> = (0..u)
             .into_par_iter()
             .map(|i| class_mask(&name_lower[name_off[i] as usize..name_off[i + 1] as usize]))
             .collect();
-        let name_bigram: Vec<u64> = (0..u)
+        let name_sig: Vec<u64> = (0..u)
             .into_par_iter()
-            .flat_map_iter(|i| {
-                let s = bigram_sig(&name_lower[name_off[i] as usize..name_off[i + 1] as usize]);
-                [s as u64, (s >> 64) as u64]
-            })
+            .map(|i| bigram_sig(&name_lower[name_off[i] as usize..name_off[i + 1] as usize]))
             .collect();
-        let mut name_sorted: Vec<u32> = (0..u as u32).collect();
-        name_sorted.par_sort_unstable_by(|&a, &b| {
-            let la = &name_lower[name_off[a as usize] as usize..name_off[a as usize + 1] as usize];
-            let lb = &name_lower[name_off[b as usize] as usize..name_off[b as usize + 1] as usize];
-            la.cmp(lb).then(a.cmp(&b))
-        });
-        let (sorted_len, sorted_stem): (Vec<u16>, Vec<u16>) = name_sorted
-            .par_iter()
-            .map(|&id| {
-                let l = &name_lower[name_off[id as usize] as usize..name_off[id as usize + 1] as usize];
-                let stem = match l.iter().rposition(|&b| b == b'.') {
-                    Some(p) if p > 0 => p,
-                    _ => l.len(),
-                };
-                (l.len().min(u16::MAX as usize) as u16, stem.min(u16::MAX as usize) as u16)
-            })
-            .unzip();
-        // --- Inverted name → entries (CSR, ascending entries).
-        let mut name_ent_off = vec![0u32; u + 1];
+        // --- Inverted name → entries: a single entry inline, else a
+        // `[count, entries…]` run in `name_multi` (ascending entries).
+        let mut count = vec![0u32; u];
         for &id in &ent_name {
-            name_ent_off[id as usize + 1] += 1;
+            count[id as usize] += 1;
         }
-        for i in 0..u {
-            name_ent_off[i + 1] += name_ent_off[i];
+        let mut name_ent = vec![0u32; u];
+        let mut multi_len = 0usize;
+        for (id, &c) in count.iter().enumerate() {
+            if c > 1 {
+                name_ent[id] = MULTI | multi_len as u32;
+                multi_len += 1 + c as usize;
+            }
         }
-        let mut fill = name_ent_off.clone();
-        let mut name_ents = vec![0u32; n];
+        let mut name_multi = vec![0u32; multi_len];
+        let mut fill = vec![0u32; u];
         for (e, &id) in ent_name.iter().enumerate() {
-            name_ents[fill[id as usize] as usize] = e as u32;
-            fill[id as usize] += 1;
+            let id = id as usize;
+            if count[id] == 1 {
+                name_ent[id] = e as u32;
+            } else {
+                let o = (name_ent[id] & !MULTI) as usize;
+                name_multi[o] = count[id];
+                name_multi[o + 1 + fill[id] as usize] = e as u32;
+                fill[id] += 1;
+            }
         }
+        drop(count);
+        drop(fill);
         let d = dir_entry.len();
-        drop(intern);
         let mut b = Builder {
             words: vec![0u64; HDR_WORDS],
             sect: [(0, 0); NSECT],
         };
         b.put(S::NameLower, &name_lower);
-        b.put(S::NameOrig, &name_orig);
         b.put(S::NameOff, &name_off);
         b.put(S::NameMask, &name_mask);
-        b.put(S::NameSorted, &name_sorted);
-        b.put(S::NameEntOff, &name_ent_off);
-        b.put(S::NameEnts, &name_ents);
+        b.put(S::NameSig, &name_sig);
+        b.put(S::NameEnt, &name_ent);
+        b.put(S::NameMulti, &name_multi);
+        b.put(S::UpperBits, &upper_bits);
+        b.put(S::UpperRank, &upper_rank);
+        b.put(S::OrigOff, &orig_off);
+        b.put(S::NameOrig, &name_orig);
         b.put(S::EntName, &ent_name);
         b.put(S::EntParent, &ent_parent);
         b.put(S::EntKind, &ent_kind);
         b.put(S::EntPrior, &ent_prior);
         b.put(S::EntSize, &ent_size);
         b.put(S::EntMtime, &ent_mtime);
-        b.put(S::EntEnd, &ent_end);
         b.put(S::DirEntry, &dir_entry);
+        b.put(S::DirEnd, &dir_end);
         b.put(S::Root, &root_b);
-        b.put(S::NameBigram, &name_bigram);
-        b.put(S::SortedLen, &sorted_len);
-        b.put(S::SortedStem, &sorted_stem);
-        drop(names);
-        drop(by_id);
         let mut words = b.words;
         words[0] = u64::from_le_bytes(*MAGIC);
         words[1] = n as u64;
         words[2] = u as u64;
         words[3] = d as u64;
         words[4] = created as u64;
+        words[5] = event_id;
         for (i, &(off, len)) in b.sect.iter().enumerate() {
-            words[5 + i * 2] = off as u64;
-            words[6 + i * 2] = len as u64;
+            words[7 + i * 2] = off as u64;
+            words[8 + i * 2] = len as u64;
         }
         Index {
             buf: Buf::Owned(words),
@@ -549,6 +688,7 @@ impl Index {
             u,
             d,
             created,
+            event_id,
         }
     }
 
@@ -586,19 +726,23 @@ impl Index {
         }
         let w = |i: usize| u64::from_ne_bytes(m[i * 8..i * 8 + 8].try_into().unwrap());
         let mut sect = [(0usize, 0usize); NSECT];
-        let sizes = [1usize, 1, 4, 8, 4, 4, 4, 4, 4, 1, 1, 8, 8, 4, 4, 1, 8, 2, 2];
         for i in 0..NSECT {
-            let (off, len) = (w(5 + i * 2) as usize, w(6 + i * 2) as usize);
-            if off % 8 != 0 || off.checked_add(len.saturating_mul(sizes[i])).is_none_or(|end| end > m.len()) {
+            let (off, len) = (w(7 + i * 2) as usize, w(8 + i * 2) as usize);
+            if off % 8 != 0 || off.checked_add(len.saturating_mul(SIZES[i])).is_none_or(|end| end > m.len()) {
                 return Err(bad("corrupt section table"));
             }
             sect[i] = (off, len);
         }
-        let (n, u, d, created) = (w(1) as usize, w(2) as usize, w(3) as usize, w(4) as i64);
-        if sect[S::EntName as usize].1 != n
-            || sect[S::NameOff as usize].1 != u + 1
-            || sect[S::NameBigram as usize].1 != 2 * u
-            || sect[S::DirEntry as usize].1 != d
+        let (n, u, d, created, event_id) = (w(1) as usize, w(2) as usize, w(3) as usize, w(4) as i64, w(5));
+        let c = |s: S| sect[s as usize].1;
+        if c(S::EntName) != n
+            || c(S::EntSize) != n
+            || c(S::NameOff) != u + 1
+            || c(S::NameSig) != u
+            || c(S::NameEnt) != u
+            || c(S::UpperBits) != u.div_ceil(64).max(1)
+            || c(S::DirEntry) != d
+            || c(S::DirEnd) != d
         {
             return Err(bad("inconsistent counts"));
         }
@@ -611,6 +755,7 @@ impl Index {
             u,
             d,
             created,
+            event_id,
         })
     }
 
@@ -635,13 +780,19 @@ pub(crate) fn path_bytes(p: &Path) -> Vec<u8> {
     p.to_string_lossy().into_owned().into_bytes()
 }
 
+pub(crate) fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Crawl + build in one call.
 pub fn build_from_disk(root: &Path, opts: &crate::walk::ScanOptions) -> Index {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let created = now_secs();
+    let event_id = crate::watch::current_event_id();
     let ls = crate::walk::scan(&root, opts);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    Index::build(ls, &root, now)
+    let refs: Vec<&Listing> = ls.iter().collect();
+    Index::build_refs(&refs, &root, created, event_id)
 }

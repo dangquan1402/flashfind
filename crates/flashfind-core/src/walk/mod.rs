@@ -5,7 +5,10 @@
 //!   batch of entries with name/type/mtime/size), adapted from fsearch (MIT).
 //! * everywhere else (and on macOS via [`scan_portable`]): `std::fs::read_dir`.
 
+pub use crate::live::Partial;
+pub use portable::mtime_of;
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -90,19 +93,39 @@ impl ScanOptions {
 /// Crawl `root` with the fastest backend for this platform. Listing id 0 is
 /// `root` itself.
 pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<Listing> {
+    scan_into(root, opts, None)
+}
+
+/// Crawl, publishing every listing to `partial` as soon as it is read (so
+/// it can be searched while the crawl runs). With `partial`, the returned
+/// vector is empty: the listings live in `partial`.
+pub fn scan_into(root: &Path, opts: &ScanOptions, partial: Option<Arc<Partial>>) -> Vec<Listing> {
     #[cfg(target_os = "macos")]
     {
-        macos::scan(root, opts)
+        macos::scan(root, opts, partial)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        portable::scan(root, opts)
+        portable::scan(root, opts, partial)
     }
 }
 
 /// The portable `read_dir` crawler (used for tests and comparisons on macOS).
 pub fn scan_portable(root: &Path, opts: &ScanOptions) -> Vec<Listing> {
-    portable::scan(root, opts)
+    portable::scan(root, opts, None)
+}
+
+/// List one directory (no recursion; children's `child` is [`NONE`]).
+/// `None` if it cannot be opened.
+pub fn list_dir(path: &Path) -> Option<Listing> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::list_dir(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        portable::list_dir(path)
+    }
 }
 
 /// Name of the backend [`scan`] uses.
@@ -113,16 +136,22 @@ pub fn backend() -> &'static str {
 pub(crate) struct Sink {
     pub next_id: std::sync::atomic::AtomicU32,
     pub out: Vec<std::sync::Mutex<Vec<Listing>>>,
+    pub partial: Option<Arc<Partial>>,
 }
 
 impl Sink {
-    pub fn new(threads: usize) -> Sink {
+    pub fn new(threads: usize, partial: Option<Arc<Partial>>) -> Sink {
         Sink {
             next_id: std::sync::atomic::AtomicU32::new(1),
             out: (0..threads + 1).map(|_| Default::default()).collect(),
+            partial,
         }
     }
     pub fn push(&self, l: Listing) {
+        if let Some(p) = &self.partial {
+            p.add(l);
+            return;
+        }
         let slot = rayon::current_thread_index().unwrap_or(self.out.len() - 1).min(self.out.len() - 1);
         self.out[slot].lock().unwrap().push(l);
     }
@@ -134,7 +163,6 @@ impl Sink {
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn join(parent: &[u8], name: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(parent.len() + 1 + name.len());
     p.extend_from_slice(parent);

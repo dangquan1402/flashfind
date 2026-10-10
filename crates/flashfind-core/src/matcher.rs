@@ -52,13 +52,13 @@ pub fn class_mask(folded: &[u8]) -> u64 {
     folded.iter().fold(0, |m, &b| m | class_bit(b))
 }
 
-/// 128-bit hashed signature of the byte bigrams in a folded name.
-pub type Sig = u128;
+/// 64-bit hashed signature of the byte bigrams in a folded name.
+pub type Sig = u64;
 
 #[inline]
 pub fn bigram_bit(a: u8, b: u8) -> Sig {
     let h = ((a as u32) << 8 | b as u32).wrapping_mul(0x9E37_79B1);
-    1u128 << (h >> 25)
+    1u64 << (h >> 26)
 }
 
 pub fn bigram_sig(folded: &[u8]) -> Sig {

@@ -43,7 +43,7 @@ fn raise_fd_limit() {
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
 }
 
-pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<Listing> {
+pub fn scan(root: &Path, opts: &ScanOptions, partial: Option<Arc<Partial>>) -> Vec<Listing> {
     let threads = opts.threads.max(1);
     raise_fd_limit();
     let pool = rayon::ThreadPoolBuilder::new()
@@ -51,12 +51,25 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<Listing> {
         .start_handler(|_| no_materialize())
         .build()
         .expect("thread pool");
-    let sink = Sink::new(threads);
+    let sink = Sink::new(threads, partial);
     let root_b = root.as_os_str().as_bytes().to_vec();
     let fd = CString::new(root_b.clone()).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) });
     let track = (!opts.skip.is_empty()).then_some(root_b);
     pool.scope(|s| finish_dir(s, fd, track, 0, opts, &sink));
     sink.finish()
+}
+
+pub fn list_dir(path: &Path) -> Option<Listing> {
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { libc::open(c.as_ptr(), OPEN_DIR) };
+    if fd < 0 {
+        return None;
+    }
+    let fd = Fd(fd);
+    no_materialize();
+    let mut l = Listing::default();
+    list_fd(fd.0, &mut l);
+    Some(l)
 }
 
 fn finish_dir<'s>(s: &rayon::Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, opts: &'s ScanOptions, sink: &'s Sink) {

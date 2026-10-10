@@ -13,7 +13,7 @@
 //!   otherwise it falls back to the full scan.
 //! * **Cancellation** – every phase polls a [`CancelToken`] between chunks.
 
-use crate::index::Index;
+use crate::index::{Index, dec_size};
 use crate::matcher::{MAX_NON_PREFIX, TYPO_MAX, may_match};
 use crate::query::{Mode, Query, Token};
 use crate::walk::{KIND_MASK, NONE};
@@ -25,8 +25,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const NAME_CHUNK: usize = 16 * 1024;
 /// Entries per parallel work item in the entry phase (approx.).
 const ENTRY_CHUNK: usize = 32 * 1024;
-/// Score credited for a token matched by an ancestor folder instead of the name.
-const ANCESTOR_SCORE: i32 = 200;
+/// A token matched by an ancestor folder instead of the name is credited
+/// `ANC_NUM/ANC_DEN` of the folder name's score, minus `ANC_DECAY` per level
+/// above the parent folder (nearer folders rank higher).
+pub(crate) const ANC_NUM: i32 = 3;
+pub(crate) const ANC_DEN: i32 = 4;
+pub(crate) const ANC_DECAY: i32 = 8;
+/// Per-token scores kept per row (for the folder + name combination).
+pub(crate) const TS: usize = 4;
+/// "No score" sentinel in per-token arrays.
+pub(crate) const NO: i16 = i16::MIN;
 /// Prior range bound (see `index::own_penalty`).
 const MAX_PRIOR: i32 = 40;
 /// Positive tokens beyond this are ignored (bitmask width).
@@ -112,10 +120,13 @@ impl SearchResult {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Row {
-    id: u32,
-    score: i32,
-    bits: u8,
+pub(crate) struct Row {
+    pub id: u32,
+    pub score: i32,
+    pub bits: u8,
+    /// Score of each of the first [`TS`] tokens against the name ([`NO`] if
+    /// it did not match).
+    pub ts: [i16; TS],
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -157,7 +168,7 @@ impl NameKey {
     }
 }
 
-struct Survivors {
+pub(crate) struct Survivors {
     key: NameKey,
     rows: Arc<Vec<Row>>,
 }
@@ -217,6 +228,8 @@ impl TopK {
 
 struct Ctx<'a> {
     idx: &'a Index,
+    /// Tombstoned entries (live overlay), one bit per entry.
+    dead: Option<&'a [u64]>,
     q: &'a Query,
     toks: &'a [Token],
     negs: Vec<memchr::memmem::Finder<'a>>,
@@ -259,22 +272,16 @@ impl Ctx<'_> {
             return None;
         }
         if toks.is_empty() {
-            return Some(Row { id, score: 0, bits: 0 });
+            return Some(Row {
+                id,
+                score: 0,
+                bits: 0,
+                ts: [NO; TS],
+            });
         }
         let orig = self.idx.orig(id);
         let sig = self.idx.sig(id);
-        let mut score = 0;
-        let mut bits = 0u8;
-        for (i, t) in toks.iter().enumerate() {
-            if toks.len() > 1 && !may_match(t.pat.mask, self.k(t), mask) {
-                continue;
-            }
-            if let Some(s) = t.score_opt(lower, orig, sig, self.typos) {
-                score += s;
-                bits |= 1 << i;
-            }
-        }
-        (bits != 0).then_some(Row { id, score, bits })
+        score_tokens(toks, lower, orig, sig, mask, self.typos).map(|(score, bits, ts)| Row { id, score, bits, ts })
     }
 
     fn full_names(&self) -> Result<Vec<Row>, Cancelled> {
@@ -351,25 +358,30 @@ impl Ctx<'_> {
     }
 
     #[inline]
-    fn entry_ok(&self, e: usize, kinds: &[u8], sizes: &[u64], mtimes: &[i64]) -> bool {
+    fn entry_ok(&self, e: usize, kinds: &[u8], sizes: &[u32], mtimes: &[u32]) -> bool {
         let q = self.q;
-        (1u8 << (kinds[e] & KIND_MASK)) & q.kinds != 0 && sizes[e] >= q.size.0 && sizes[e] <= q.size.1 && mtimes[e] >= q.mtime.0 && mtimes[e] <= q.mtime.1
+        if let Some(d) = self.dead
+            && (d[e >> 6] >> (e & 63)) & 1 != 0
+        {
+            return false;
+        }
+        let (sz, mt) = (dec_size(sizes[e]), mtimes[e] as i64);
+        (1u8 << (kinds[e] & KIND_MASK)) & q.kinds != 0 && sz >= q.size.0 && sz <= q.size.1 && mt >= q.mtime.0 && mt <= q.mtime.1
     }
 
     /// Expand name rows to entries and keep the top `limit`.
-    fn entries(&self, rows: &[Row], range: (u32, u32), anc: Option<&[u8]>) -> Result<(Vec<Hit>, u64), Cancelled> {
+    fn entries(&self, rows: &[Row], range: (u32, u32), anc: Option<&Anc>) -> Result<(Vec<Hit>, u64), Cancelled> {
         let idx = self.idx;
-        let (kinds, sizes, mtimes, prior, parent) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime(), idx.ent_prior(), idx.ent_parent());
+        let (kinds, sizes, mtimes, prior, parent) = (idx.ent_kind(), idx.ent_size_raw(), idx.ent_mtime_raw(), idx.ent_prior(), idx.ent_parent());
         let ntok = self.toks.len().min(MAX_TOKENS);
         let all: u8 = if ntok == 0 { 0 } else { ((1u16 << ntok) - 1) as u8 };
         let full_range = range == (0, idx.n as u32);
         let limit = self.q.limit.max(1);
         // Chunk rows so each work item expands roughly ENTRY_CHUNK entries.
-        let off = idx.name_ent_off();
         let mut bounds = vec![0usize];
         let mut acc = 0usize;
         for (i, r) in rows.iter().enumerate() {
-            acc += (off[r.id as usize + 1] - off[r.id as usize]) as usize;
+            acc += idx.count_of(r.id);
             if acc >= ENTRY_CHUNK {
                 bounds.push(i + 1);
                 acc = 0;
@@ -400,12 +412,17 @@ impl Ctx<'_> {
                         let mut score = r.score;
                         if let Some(anc) = anc {
                             let p = parent[eu];
-                            let ab = if p == NONE { 0 } else { anc[p as usize] };
-                            let missing = all & !r.bits;
-                            if missing & !ab != 0 {
-                                continue;
+                            if p == NONE {
+                                if r.bits != all {
+                                    continue;
+                                }
+                            } else {
+                                let p = p as usize;
+                                let Some(s) = combine(r, all, ntok, anc.bits[p], &anc.score[p * anc.nt..p * anc.nt + anc.nt]) else {
+                                    continue;
+                                };
+                                score = s;
                             }
-                            score += ANCESTOR_SCORE * missing.count_ones() as i32;
                         } else if r.bits != all {
                             continue;
                         }
@@ -424,10 +441,13 @@ impl Ctx<'_> {
 
     fn no_entry_filters(&self) -> bool {
         let q = self.q;
-        q.kinds == crate::query::KINDS_ALL && q.size == (0, u64::MAX) && q.mtime == (i64::MIN, i64::MAX)
+        self.dead.is_none() && q.kinds == crate::query::KINDS_ALL && q.size == (0, u64::MAX) && q.mtime == (i64::MIN, i64::MAX)
     }
 
     fn count_in_range(&self, id: u32, range: (u32, u32)) -> u64 {
+        if range == (0, self.idx.n as u32) {
+            return self.idx.count_of(id) as u64;
+        }
         let ents = self.idx.entries_of(id);
         if range == (0, self.idx.n as u32) {
             return ents.len() as u64;
@@ -440,7 +460,7 @@ impl Ctx<'_> {
     /// Returns (hits, entries seen, stopped early).
     fn entries_ranked(&self, rows: &[Row], range: (u32, u32), limit: usize) -> Result<(Vec<Hit>, u64, bool), Cancelled> {
         let idx = self.idx;
-        let (kinds, sizes, mtimes, prior) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime(), idx.ent_prior());
+        let (kinds, sizes, mtimes, prior) = (idx.ent_kind(), idx.ent_size_raw(), idx.ent_mtime_raw(), idx.ent_prior());
         let full_range = range == (0, idx.n as u32);
         let mut tk = TopK::new(limit);
         // Wave 1 (sequential): best rows until the page is full.
@@ -482,29 +502,54 @@ impl Ctx<'_> {
         Ok((buf, total, j < rows.len()))
     }
 
-    /// Ancestor token bits per directory id (multi-token queries).
-    fn ancestors(&self, rows: &[Row]) -> Vec<u8> {
+    /// Per directory id: which tokens some ancestor folder (or the folder
+    /// itself) matches, and the best decayed score per token.
+    fn ancestors(&self, rows: &[Row]) -> Anc {
         let idx = self.idx;
-        let mut name_bits = vec![0u8; idx.u];
-        for r in rows {
-            name_bits[r.id as usize] = r.bits;
+        let nt = self.toks.len().min(TS);
+        thread_local! {
+            static SLOT: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let (dir_entry, parent, ent_name) = (idx.dir_entry(), idx.ent_parent(), idx.ent_name());
-        let mut anc = vec![0u8; idx.d];
-        // Dir ids follow DFS order: a parent's id is always smaller. The
-        // root's own name never counts.
-        for did in 1..idx.d {
-            let e = dir_entry[did] as usize;
-            let p = parent[e];
-            let up = if p == NONE { 0 } else { anc[p as usize] };
-            anc[did] = up | name_bits[ent_name[e] as usize];
-        }
-        anc
+        SLOT.with_borrow_mut(|slot| {
+            if slot.len() < idx.u {
+                slot.resize(idx.u, u32::MAX);
+            }
+            for (i, r) in rows.iter().enumerate() {
+                slot[r.id as usize] = i as u32;
+            }
+            let (dir_entry, parent, ent_name) = (idx.dir_entry(), idx.ent_parent(), idx.ent_name());
+            let mut bits = vec![0u8; idx.d];
+            let mut score = vec![NO; idx.d * nt];
+            // Dir ids follow DFS order: a parent's id is always smaller. The
+            // root's own name never counts.
+            for did in 1..idx.d {
+                let e = dir_entry[did] as usize;
+                let p = parent[e];
+                let (up_bits, up) = if p == NONE || p == 0 {
+                    (0, None)
+                } else {
+                    (bits[p as usize], Some(p as usize * nt))
+                };
+                let row = slot[ent_name[e] as usize];
+                let own = (row != u32::MAX).then(|| &rows[row as usize]);
+                bits[did] = up_bits | own.map_or(0, |r| r.bits);
+                for t in 0..nt {
+                    let a = up.map_or(NO, |u| score[u + t]);
+                    let a = if a == NO { NO } else { a - ANC_DECAY as i16 };
+                    let o = own.map_or(NO, |r| r.ts[t]);
+                    score[did * nt + t] = a.max(o);
+                }
+            }
+            for r in rows {
+                slot[r.id as usize] = u32::MAX;
+            }
+            Anc { bits, score, nt }
+        })
     }
 
     fn entry_scan(&self, range: (u32, u32)) -> Result<(Vec<Hit>, u64), Cancelled> {
         let idx = self.idx;
-        let (kinds, sizes, mtimes, prior) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime(), idx.ent_prior());
+        let (kinds, sizes, mtimes, prior) = (idx.ent_kind(), idx.ent_size_raw(), idx.ent_mtime_raw(), idx.ent_prior());
         let limit = self.q.limit.max(1);
         let lo = range.0.max(1) as usize;
         let hi = range.1 as usize;
@@ -527,6 +572,66 @@ impl Ctx<'_> {
         self.check()?;
         Ok(top.finish())
     }
+}
+
+pub(crate) struct Anc {
+    bits: Vec<u8>,
+    score: Vec<i16>,
+    nt: usize,
+}
+
+/// Score each positive token against one name: (sum, matched bits,
+/// per-token scores for the first [`TS`] tokens).
+#[inline]
+pub(crate) fn score_tokens(toks: &[Token], lower: &[u8], orig: &[u8], sig: crate::matcher::Sig, mask: u64, typos: bool) -> Option<(i32, u8, [i16; TS])> {
+    let mut score = 0;
+    let mut bits = 0u8;
+    let mut ts = [NO; TS];
+    for (i, t) in toks.iter().enumerate().take(MAX_TOKENS) {
+        let k = if typos { t.pat.typos } else { 0 };
+        if toks.len() > 1 && !may_match(t.pat.mask, k, mask) {
+            continue;
+        }
+        if let Some(s) = t.score_opt(lower, orig, sig, typos) {
+            score += s;
+            bits |= 1 << i;
+            if i < TS {
+                ts[i] = s as i16;
+            }
+        }
+    }
+    (bits != 0).then_some((score, bits, ts))
+}
+
+/// Combined score of a multi-token row given its parent folder's ancestor
+/// bits/scores: each token counts the better of the name's own match and the
+/// (scaled) nearest-folder match; `None` if some token is matched by neither.
+#[inline]
+pub(crate) fn combine(r: &Row, all: u8, ntok: usize, anc_bits: u8, anc: &[i16]) -> Option<i32> {
+    let missing = all & !r.bits;
+    if missing & !anc_bits != 0 {
+        return None;
+    }
+    if ntok > TS {
+        // Beyond TS tokens only the name's total is known: add the folder
+        // credit for the missing ones (no per-token max).
+        let mut s = r.score;
+        for (t, &a) in anc.iter().enumerate() {
+            if missing & (1 << t) != 0 {
+                s += a as i32 * ANC_NUM / ANC_DEN;
+            }
+        }
+        let rest = missing >> TS;
+        return Some(s + rest.count_ones() as i32 * 200);
+    }
+    let mut s = 0;
+    for t in 0..ntok {
+        let own = r.ts[t];
+        let a = anc[t];
+        let a = if a == NO { NO as i32 } else { a as i32 * ANC_NUM / ANC_DEN };
+        s += (own as i32).max(a);
+    }
+    Some(s)
 }
 
 fn has_ext(lower: &[u8], exts: &[Vec<u8>]) -> bool {
@@ -552,7 +657,15 @@ fn sort_rows_desc(mut rows: Vec<Row>) -> Vec<Row> {
     for i in 0..span {
         count[i + 1] += count[i];
     }
-    let mut out = vec![Row { id: 0, score: 0, bits: 0 }; rows.len()];
+    let mut out = vec![
+        Row {
+            id: 0,
+            score: 0,
+            bits: 0,
+            ts: [NO; TS]
+        };
+        rows.len()
+    ];
     // Stable: equal scores keep name order (ties are broken per entry later).
     for r in &rows {
         let slot = &mut count[(hi - r.score) as usize];
@@ -563,22 +676,37 @@ fn sort_rows_desc(mut rows: Vec<Row>) -> Vec<Row> {
     out
 }
 
-/// Contiguous range of `name_sorted` whose names start with `t`.
+/// Contiguous range of name ids (names are numbered in sorted order) whose
+/// names start with `t`.
 pub fn prefix_range(idx: &Index, t: &[u8]) -> std::ops::Range<usize> {
-    let s = idx.name_sorted();
-    let lo = s.partition_point(|&id| idx.lower(id) < t);
-    let len = s[lo..].partition_point(|&id| idx.lower(id).starts_with(t));
-    lo..lo + len
+    let pp = |lo: usize, hi: usize, f: &dyn Fn(&[u8]) -> bool| {
+        let (mut lo, mut hi) = (lo, hi);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if f(idx.lower(mid as u32)) { lo = mid + 1 } else { hi = mid }
+        }
+        lo
+    };
+    let lo = pp(0, idx.u, &|n| n < t);
+    let hi = pp(lo, idx.u, &|n| n.starts_with(t));
+    lo..hi
 }
 
-fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &CancelToken, shortcuts: bool) -> Result<SearchResult, Cancelled> {
+pub(crate) fn run(
+    idx: &Index,
+    q: &Query,
+    mut cache: Option<&mut Vec<Survivors>>,
+    cancel: &CancelToken,
+    shortcuts: bool,
+    dead: Option<&[u64]>,
+) -> Result<SearchResult, Cancelled> {
     if cancel.is_cancelled() {
         return Err(Cancelled);
     }
     let range = match &q.scope {
         None => (0u32, idx.n as u32),
         Some(p) => match idx.lookup(p) {
-            Some(e) => (e + 1, idx.ent_end()[e as usize]),
+            Some(e) => (e + 1, idx.end(e)),
             None => return Ok(SearchResult::empty(Strategy::Full)),
         },
     };
@@ -586,6 +714,7 @@ fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &
     let negs = q.negs.iter().map(|n| memchr::memmem::Finder::new(n)).collect();
     let mut ctx = Ctx {
         idx,
+        dead,
         q,
         toks,
         negs,
@@ -615,32 +744,41 @@ fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &
         let complete = matches!(t.mode, Mode::Prefix | Mode::Exact);
         let t0 = std::time::Instant::now();
         let r = prefix_range(idx, &t.pat.text);
-        let ids = &idx.name_sorted()[r.clone()];
+        let nids = r.len();
         let rows: Vec<Row> = if q.exts.is_empty() && q.negs.is_empty() {
             // Fast path: every name in the range is an exact/stem/prefix
-            // match whose score depends only on its length and stem length,
-            // read sequentially from the sorted-order side arrays.
-            let (lens, stems) = (&idx.sorted_len()[r.clone()], &idx.sorted_stem()[r]);
+            // match whose score depends only on its length and whether the
+            // rest is a single extension. Ids in the range are contiguous, so
+            // offsets and bytes are read sequentially.
+            let (off, bytes) = (idx.name_off(), idx.name_lower());
             let m = t.pat.text.len();
             let exact_only = t.mode == Mode::Exact;
-            let mut rows = Vec::with_capacity(ids.len());
-            for i in 0..ids.len() {
-                let (n, st) = (lens[i] as usize, stems[i] as usize);
+            let mut rows = Vec::with_capacity(nids);
+            for id in r.clone() {
+                let (a, b) = (off[id] as usize, off[id + 1] as usize);
+                let n = b - a;
                 let score = if n == m {
                     crate::matcher::EXACT
                 } else if exact_only {
                     continue;
-                } else if t.mode == Mode::Fuzzy && st == m {
+                } else if t.mode == Mode::Fuzzy && bytes[a + m] == b'.' && !bytes[a + m + 1..b].contains(&b'.') {
                     crate::matcher::STEM - ((n - m - 1) as i32).min(10)
                 } else {
                     crate::matcher::PREFIX - crate::matcher::prefix_pen(n - m)
                 };
-                rows.push(Row { id: ids[i], score, bits: 1 });
+                let mut ts = [NO; TS];
+                ts[0] = score as i16;
+                rows.push(Row {
+                    id: id as u32,
+                    score,
+                    bits: 1,
+                    ts,
+                });
             }
             rows
         } else {
             let masks = idx.name_mask();
-            ids.iter().filter_map(|&id| ctx.score_name(id, masks[id as usize])).collect()
+            r.clone().filter_map(|id| ctx.score_name(id as u32, masks[id])).collect()
         };
         let rows = sort_rows_desc(rows);
         let name_us = t0.elapsed().as_micros() as u32;
@@ -663,7 +801,7 @@ fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &
                 total,
                 total_exact: complete,
                 strategy: Strategy::PrefixRange,
-                names_scored: ids.len(),
+                names_scored: nids,
                 names_matched: rows.len(),
                 name_us,
                 entry_us: t1.elapsed().as_micros() as u32,
@@ -707,11 +845,11 @@ fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &
     let anc = (toks.len() > 1).then(|| ctx.ancestors(&rows));
     let pruned: Option<Vec<Row>> = anc.as_ref().map(|a| {
         // A token no folder name matches must be matched by the name itself.
-        let any_dir = a.iter().fold(0u8, |m, &b| m | b);
+        let any_dir = a.bits.iter().fold(0u8, |m, &b| m | b);
         let all: u8 = ((1u16 << toks.len()) - 1) as u8;
         rows.iter().copied().filter(|r| (all & !r.bits) & !any_dir == 0).collect()
     });
-    let (hits, total) = ctx.entries(pruned.as_deref().unwrap_or(&rows), range, anc.as_deref())?;
+    let (hits, total) = ctx.entries(pruned.as_deref().unwrap_or(&rows), range, anc.as_ref())?;
     Ok(SearchResult {
         hits,
         total,
@@ -758,13 +896,13 @@ fn name_phase(ctx: &Ctx, key: NameKey, cache: Option<&mut Vec<Survivors>>) -> Re
 
 /// One-shot search (no narrowing cache).
 pub fn search(idx: &Index, q: &Query, cancel: &CancelToken) -> Result<SearchResult, Cancelled> {
-    run(idx, q, None, cancel, true)
+    run(idx, q, None, cancel, true, None)
 }
 
 /// Full scan with every shortcut disabled (reference for tests/benches).
 #[doc(hidden)]
 pub fn search_reference(idx: &Index, q: &Query, cancel: &CancelToken) -> Result<SearchResult, Cancelled> {
-    run(idx, q, None, cancel, false)
+    run(idx, q, None, cancel, false, None)
 }
 
 /// Per-search-box state: keeps recent survivor sets so each keystroke only
@@ -783,7 +921,7 @@ impl Session {
     }
     pub fn search(&mut self, q: &Query, cancel: &CancelToken) -> Result<SearchResult, Cancelled> {
         let idx = self.idx.clone();
-        run(&idx, q, Some(&mut self.cache), cancel, true)
+        run(&idx, q, Some(&mut self.cache), cancel, true, None)
     }
     pub fn clear(&mut self) {
         self.cache.clear();

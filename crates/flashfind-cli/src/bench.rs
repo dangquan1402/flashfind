@@ -60,6 +60,12 @@ pub fn run(mut a: Args) {
                     h.0 += 1;
                     h.1 += (paths.first().map(String::as_str) == Some(e)) as usize;
                     h.2 += paths.iter().take(10).any(|p| p == e) as usize;
+                    if paths.first().map(String::as_str) != Some(e) && std::env::var_os("FLASHFIND_MISSES").is_some() {
+                        eprintln!("MISS [{class}] {s:?}\n  want {e}");
+                        for (p, h) in paths.iter().zip(&r.hits).take(3) {
+                            eprintln!("  got  {} {p}", h.score);
+                        }
+                    }
                 }
             }
         }

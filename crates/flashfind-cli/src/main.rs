@@ -199,7 +199,7 @@ fn cmd_search(mut a: Args) {
             .iter()
             .map(|h| {
                 let e = h.entry as usize;
-                serde_json::json!({"path": idx.path_string(h.entry), "score": h.score, "kind": KINDS[(idx.ent_kind()[e] & 3) as usize], "size": idx.ent_size()[e], "mtime": idx.ent_mtime()[e]})
+                serde_json::json!({"path": idx.path_string(h.entry), "score": h.score, "kind": KINDS[(idx.ent_kind()[e] & 3) as usize], "size": idx.size(h.entry), "mtime": idx.mtime(h.entry)})
             })
             .collect();
         println!(

@@ -8,13 +8,30 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use flashfind_core::{CancelToken, Index, Query, Session};
+use flashfind_core::{CancelToken, Index, Live, LiveOptions, LiveSession, Query};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub struct FfIndex(Arc<Index>);
-pub struct FfSession(Mutex<Session>);
+pub struct FfLive(Arc<Live>);
+pub struct FfSession(Mutex<LiveSession>);
+
+#[repr(C)]
+#[derive(Default)]
+pub struct FfProgress {
+    /// 0 crawling, 1 building, 2 ready.
+    pub phase: u8,
+    pub watching: u8,
+    pub entries: u64,
+    pub dirs: u64,
+    pub overlay: u64,
+    pub dead: u64,
+    pub last_event_id: u64,
+    pub generation: u64,
+    pub compactions: u64,
+    pub elapsed_ms: f64,
+}
 pub struct FfCancel(CancelToken);
 
 #[repr(C)]
@@ -125,7 +142,10 @@ pub unsafe extern "C" fn ff_index_free(idx: *mut FfIndex) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ff_session_new(idx: *const FfIndex) -> *mut FfSession {
     match unsafe { idx.as_ref() } {
-        Some(i) => Box::into_raw(Box::new(FfSession(Mutex::new(Session::new(i.0.clone()))))),
+        Some(i) => Box::into_raw(Box::new(FfSession(Mutex::new(LiveSession::new(Live::from_index(
+            i.0.clone(),
+            LiveOptions::default(),
+        )))))),
         None => std::ptr::null_mut(),
     }
 }
@@ -196,32 +216,27 @@ pub unsafe extern "C" fn ff_search(
         Ok(r) => r,
         Err(_) => return FF_CANCELLED,
     };
-    let idx = guard.index().clone();
     drop(guard);
     if token.is_cancelled() {
         return FF_CANCELLED;
     }
-    let (kinds, sizes, mtimes) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime());
     let paths: Vec<CString> = res
         .hits
         .iter()
-        .map(|h| CString::new(idx.path_string(h.entry).replace('\0', "")).unwrap_or_default())
+        .map(|h| CString::new(h.path_str().replace('\0', "")).unwrap_or_default())
         .collect();
     let hits: Vec<FfHit> = res
         .hits
         .iter()
         .zip(&paths)
-        .map(|(h, p)| {
-            let e = h.entry as usize;
-            FfHit {
-                path: p.as_ptr(),
-                path_len: p.as_bytes().len() as u32,
-                kind: kinds[e] & 3,
-                score: h.score,
-                size: sizes[e],
-                mtime: mtimes[e],
-                entry: h.entry,
-            }
+        .map(|(h, p)| FfHit {
+            path: p.as_ptr(),
+            path_len: p.as_bytes().len() as u32,
+            kind: h.kind,
+            score: h.score,
+            size: h.size,
+            mtime: h.mtime,
+            entry: h.entry,
         })
         .collect();
     let page = FfPage {
@@ -236,6 +251,134 @@ pub unsafe extern "C" fn ff_search(
         unsafe { cb(ctx, &page) };
     }
     FF_OK
+}
+
+fn live_opts(threads: u32, poll_ms: u32) -> LiveOptions {
+    let mut o = LiveOptions::default();
+    if threads > 0 {
+        o.threads = threads as usize;
+    }
+    if poll_ms > 0 {
+        o.poll = std::time::Duration::from_millis(poll_ms as u64);
+    }
+    o
+}
+
+/// Open a saved index for live use (compactions are saved back to it).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_open(path: *const c_char, err: *mut *mut c_char) -> *mut FfLive {
+    let Some(p) = (unsafe { cstr(path) }) else {
+        set_err(err, "path is NULL or not UTF-8");
+        return std::ptr::null_mut();
+    };
+    match Live::open(Path::new(p), LiveOptions::default()) {
+        Ok(l) => Box::into_raw(Box::new(FfLive(l))),
+        Err(e) => {
+            set_err(err, &e.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Start crawling `root` in the background; searchable immediately
+/// (partial results until `ff_live_progress` reports phase 2). `index_path`
+/// may be NULL (memory only).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_crawl(root: *const c_char, index_path: *const c_char, threads: u32, err: *mut *mut c_char) -> *mut FfLive {
+    let Some(r) = (unsafe { cstr(root) }) else {
+        set_err(err, "root is NULL or not UTF-8");
+        return std::ptr::null_mut();
+    };
+    let path = unsafe { cstr(index_path) }.map(std::path::PathBuf::from);
+    Box::into_raw(Box::new(FfLive(Live::crawl(Path::new(r), path, live_opts(threads, 0)))))
+}
+
+/// Watch for changes (FSEvents on macOS; polling every `poll_ms` elsewhere).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_watch(l: *const FfLive, err: *mut *mut c_char) -> i32 {
+    let Some(l) = (unsafe { l.as_ref() }) else {
+        set_err(err, "live is NULL");
+        return FF_ERROR;
+    };
+    match l.0.watch() {
+        Ok(()) => FF_OK,
+        Err(e) => {
+            set_err(err, &e.to_string());
+            FF_ERROR
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_unwatch(l: *const FfLive) {
+    if let Some(l) = unsafe { l.as_ref() } {
+        l.0.unwatch();
+    }
+}
+
+/// Relist one directory now (e.g. after the app itself changed it).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_refresh(l: *const FfLive, dir: *const c_char) -> i32 {
+    match (unsafe { l.as_ref() }, unsafe { cstr(dir) }) {
+        (Some(l), Some(d)) => {
+            l.0.refresh(&[d.as_bytes()]);
+            FF_OK
+        }
+        _ => FF_ERROR,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_progress(l: *const FfLive, out: *mut FfProgress) {
+    let (Some(l), Some(out)) = (unsafe { l.as_ref() }, unsafe { out.as_mut() }) else {
+        return;
+    };
+    let p = l.0.progress();
+    *out = FfProgress {
+        phase: p.phase,
+        watching: p.watching as u8,
+        entries: p.entries,
+        dirs: p.dirs,
+        overlay: p.overlay,
+        dead: p.dead,
+        last_event_id: p.last_event_id,
+        generation: p.generation,
+        compactions: p.compactions,
+        elapsed_ms: p.elapsed_ms,
+    };
+}
+
+/// Fold live changes into a new base index (saved if the index has a path).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_compact(l: *const FfLive) -> i32 {
+    match unsafe { l.as_ref() } {
+        Some(l) => l.0.compact() as i32,
+        None => FF_ERROR,
+    }
+}
+
+/// Compact if dirty, else record the last event id (call before quitting).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_checkpoint(l: *const FfLive) {
+    if let Some(l) = unsafe { l.as_ref() } {
+        l.0.checkpoint();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_session_new(l: *const FfLive) -> *mut FfSession {
+    match unsafe { l.as_ref() } {
+        Some(l) => Box::into_raw(Box::new(FfSession(Mutex::new(LiveSession::new(l.0.clone()))))),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_live_free(l: *mut FfLive) {
+    if !l.is_null() {
+        let b = unsafe { Box::from_raw(l) };
+        b.0.unwatch();
+    }
 }
 
 #[unsafe(no_mangle)]

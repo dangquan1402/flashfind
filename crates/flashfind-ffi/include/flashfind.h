@@ -70,6 +70,42 @@ int32_t ff_search(ff_session *s, const char *query, uint32_t limit, const ff_can
 
 void ff_string_free(char *s);
 
+/* ---- Live index: base index + in-memory overlay of changes ---------- */
+typedef struct FfLive ff_live;
+
+typedef struct {
+    uint8_t phase;          /* 0 crawling, 1 building, 2 ready */
+    uint8_t watching;
+    uint64_t entries;       /* crawled so far (crawling) / in the base index */
+    uint64_t dirs;
+    uint64_t overlay;       /* entries added/changed since the base index */
+    uint64_t dead;          /* base entries removed or replaced */
+    uint64_t last_event_id; /* newest FSEvents id applied */
+    uint64_t generation;    /* bumps when compaction swaps the base */
+    uint64_t compactions;
+    double elapsed_ms;
+} ff_progress;
+
+/* Open a saved index for live use; compactions are saved back to it. */
+ff_live *ff_live_open(const char *index_path, char **err);
+/* Crawl in the background; searchable at once (partial results while
+   phase < 2). index_path may be NULL (memory only). */
+ff_live *ff_live_crawl(const char *root, const char *index_path, uint32_t threads, char **err);
+/* Watch for changes: FSEvents on macOS (replays events since the saved
+   index), mtime polling elsewhere. */
+int ff_live_watch(const ff_live *live, char **err);
+void ff_live_unwatch(const ff_live *live);
+/* Relist one directory now. */
+int ff_live_refresh(const ff_live *live, const char *dir);
+void ff_live_progress(const ff_live *live, ff_progress *out);
+/* 1 if compacted, 0 if nothing to do. */
+int ff_live_compact(const ff_live *live);
+/* Compact if dirty, else record the last event id. Call before quitting. */
+void ff_live_checkpoint(const ff_live *live);
+/* Search session over the live index (use with ff_search). */
+ff_session *ff_live_session_new(const ff_live *live);
+void ff_live_free(ff_live *live);
+
 #ifdef __cplusplus
 }
 #endif

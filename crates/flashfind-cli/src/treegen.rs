@@ -315,7 +315,7 @@ pub fn run(o: &GenOpts) -> std::io::Result<()> {
         };
         let mut n = name.clone();
         let mut k = 2;
-        while !used.insert((p, n.clone())) {
+        while !used.insert((p, n.to_lowercase())) {
             n = format!("{name} {k}");
             k += 1;
         }
@@ -345,7 +345,7 @@ pub fn run(o: &GenOpts) -> std::io::Result<()> {
         let base = format!("{}.{}", file_stem(&mut r), ext(&mut r));
         let mut n = base.clone();
         let mut k = 2;
-        while !used.insert((d, n.clone())) {
+        while !used.insert((d, n.to_lowercase())) {
             let (s, e) = base.rsplit_once('.').unwrap();
             n = format!("{s} ({k}).{e}");
             k += 1;
@@ -385,6 +385,7 @@ pub fn run(o: &GenOpts) -> std::io::Result<()> {
     );
     write_queries(o, &mut r, &dirs, &drel, &files)?;
     Ok(())
+    // (`bench/run.sh` drops a `.complete` marker next to the tree afterwards.)
 }
 
 fn typo(r: &mut Rng, s: &str, kind: &str) -> Option<String> {

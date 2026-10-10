@@ -21,9 +21,12 @@ echo "== build"
 FF="$REPO/target/release/flashfind"
 FS="$REPO/bench/fsearch-baseline/target/release/fsearch-baseline"
 
-if [ ! -d "$TREE" ]; then
+if [ ! -f "$TREE.complete" ]; then
+  # A partial tree from an interrupted run is ours to remove.
+  case "$TREE" in "$BENCH"/tree-*) rm -rf "$TREE" ;; esac
   echo "== generate $FILES files (seed $SEED) in $TREE"
   "$FF" gen --root "$TREE" --files "$FILES" --seed "$SEED" --queries "$Q"
+  touch "$TREE.complete"
 fi
 
 echo "== warm-up crawl (fills the metadata cache; not measured)"

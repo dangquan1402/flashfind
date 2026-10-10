@@ -71,6 +71,7 @@ fn world(tag: &str) -> (PathBuf, Config) {
     // Not repos / not to be searched.
     put(&home, "Library/Caches/dev/fake/.git/HEAD", "ref: refs/heads/main\n");
     put(&home, "dev/bench.noindex/fake/.git/HEAD", "ref: refs/heads/main\n");
+    put(&home, "Desktop/__MACOSX/copy/.git/HEAD", "ref: refs/heads/main\n");
     put(&home, "Documents/router_notes.txt", "x");
     let cfg = Config {
         roots: vec![home.clone()],

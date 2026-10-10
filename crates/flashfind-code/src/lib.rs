@@ -77,6 +77,10 @@ pub const DISCOVERY_SKIP: &[&str] = &[
     "go",
     "miniconda3",
     "anaconda3",
+    // Zip-extraction debris (AppleDouble copies of whole trees).
+    "__MACOSX",
+    // OrbStack / Docker image and volume mounts.
+    "OrbStack",
 ];
 
 #[derive(Clone, Debug)]

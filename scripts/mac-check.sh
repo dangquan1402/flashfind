@@ -46,10 +46,12 @@ PY
 rm -f "$OUT"
 if [ "$APP" = 1 ]; then
   echo "== app"
-  scripts/build-app.sh 2>&1 | tail -2
+  scripts/build-app.sh > /tmp/flashfind-build-app.log 2>&1 || { grep -E "error" /tmp/flashfind-build-app.log | head -20; echo "APP BUILD FAILED"; exit 1; }
+  tail -1 /tmp/flashfind-build-app.log
   ARGS=(--quit-after 1.5 --window-id-file /tmp/flashfind-wid.txt)
   [ -n "$SNAP" ] && ARGS+=(--snapshot "$SNAP")
   [ -n "$QUERY" ] && ARGS+=(--query "$QUERY")
+  [ -n "${CWD:-}" ] && ARGS+=(--cwd "$CWD")
   rm -f /tmp/flashfind-wid.txt
   "$REPO/dist/FlashFind.app/Contents/MacOS/FlashFind" "${ARGS[@]}" &
   APID=$!

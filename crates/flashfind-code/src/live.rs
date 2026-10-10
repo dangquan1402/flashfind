@@ -131,6 +131,7 @@ pub type TouchHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Files modified this recently when their folder's change event arrives
 /// count as edits (folder-level FSEvents carry no file names).
 const TOUCH_WINDOW: i64 = 120;
+const BULK_TOUCH: usize = 6;
 
 fn hidden_or_skipped(name: &str, cfg: &Config) -> bool {
     name.starts_with('.')
@@ -188,6 +189,7 @@ impl CodeLive {
     fn touches_in(&self, dir: &Path) {
         let Some(m) = self.memory.lock().unwrap().clone() else { return };
         let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let mut fresh: Vec<String> = Vec::new();
         let now = crate::memory::now();
         let snap = self.snapshot();
         // Only files the index knows (not gitignored logs/build output).
@@ -208,7 +210,17 @@ impl CodeLive {
                 continue;
             }
             let p = e.path().to_string_lossy().into_owned();
-            if indexed(&p) && m.record_touch(&p) {
+            if indexed(&p) {
+                fresh.push(p);
+            }
+        }
+        // Many files at once in one folder: a checkout, pull or formatter run,
+        // not edits you made.
+        if fresh.len() > BULK_TOUCH {
+            return;
+        }
+        for p in fresh {
+            if m.record_touch(&p) {
                 for h in self.touch_hooks.lock().unwrap().iter() {
                     h(&p);
                 }
@@ -266,6 +278,13 @@ impl CodeLive {
     /// Apply directory-level change notifications. Returns the number of
     /// repos re-walked, added or removed.
     pub fn apply(&self, events: &[(PathBuf, u32)]) -> usize {
+        self.apply_with(events, true)
+    }
+
+    /// `touches`: also record recently modified files as edits (live
+    /// watcher events; not the startup catch-up, which would count a
+    /// `git pull` from before launch as edits).
+    fn apply_with(&self, events: &[(PathBuf, u32)], touches: bool) -> usize {
         if events.is_empty() {
             return 0;
         }
@@ -297,7 +316,7 @@ impl CodeLive {
                 } else if !lossy && comps.iter().any(|c| self.cfg.junk.iter().any(|j| j == c)) {
                     // node_modules churn and the like.
                 } else {
-                    if !lossy && flags & HISTORY_DONE == 0 {
+                    if touches && !lossy && flags & HISTORY_DONE == 0 {
                         self.touches_in(p);
                     }
                     rewalk.insert(repo);
@@ -452,7 +471,7 @@ impl CodeLive {
             st.base_event_id = ev;
         }
         *self.last_compact.lock().unwrap() = Instant::now();
-        self.apply(&replay);
+        self.apply_with(&replay, false);
     }
 
     fn request_compact(&self) {
@@ -621,7 +640,7 @@ impl CodeLive {
                 .collect();
             events.extend(changed);
         }
-        self.apply(&events)
+        self.apply_with(&events, false)
     }
 
     /// Fold overlays into a fresh saved base (call before quitting).

@@ -109,6 +109,7 @@ pub struct CodeLive {
     last_compact: Mutex<Instant>,
     stop: Arc<AtomicBool>,
     me: Weak<CodeLive>,
+    built_here: bool,
     #[cfg(target_os = "macos")]
     streams: Mutex<Vec<watch::Stream>>,
     /// Compact when this many repos are overlaid.
@@ -132,10 +133,11 @@ fn hidden_or_skipped(name: &str, cfg: &Config) -> bool {
 }
 
 impl CodeLive {
-    fn with(cfg: Config, cache: Option<PathBuf>, base: CodeIndex) -> Arc<CodeLive> {
+    fn with(cfg: Config, cache: Option<PathBuf>, base: CodeIndex, built_here: bool) -> Arc<CodeLive> {
         let ev = base.event_id;
         Arc::new_cyclic(|me| CodeLive {
             me: me.clone(),
+            built_here,
             cfg,
             cache,
             snap: RwLock::new(Arc::new(Snap::new(Arc::new(base), 0))),
@@ -160,23 +162,27 @@ impl CodeLive {
     }
 
     pub fn from_index(cfg: Config, base: CodeIndex) -> Arc<CodeLive> {
-        CodeLive::with(cfg, None, base)
+        CodeLive::with(cfg, None, base, true)
     }
 
     /// Load the cached index for `cfg.roots` (or build and cache it).
     pub fn open(cfg: Config, cache: Option<PathBuf>) -> Arc<CodeLive> {
-        let base = cache
-            .as_ref()
-            .and_then(|d| CodeIndex::load(d).ok())
-            .filter(|c| c.roots == cfg.roots)
-            .unwrap_or_else(|| {
-                let c = CodeIndex::build_tracked(&cfg);
-                if let Some(d) = &cache {
-                    let _ = c.save(d);
-                }
-                c
-            });
-        CodeLive::with(cfg, cache, base)
+        let loaded = cache.as_ref().and_then(|d| CodeIndex::load(d).ok()).filter(|c| c.roots == cfg.roots);
+        let built_here = loaded.is_none();
+        let base = loaded.unwrap_or_else(|| {
+            let c = CodeIndex::build_tracked(&cfg);
+            if let Some(d) = &cache {
+                let _ = c.save(d);
+            }
+            c
+        });
+        CodeLive::with(cfg, cache, base, built_here)
+    }
+
+    /// True when [`CodeLive::open`] had no usable cache and crawled just now
+    /// (so there is nothing to catch up on).
+    pub fn just_built(&self) -> bool {
+        self.built_here
     }
 
     pub fn config(&self) -> &Config {

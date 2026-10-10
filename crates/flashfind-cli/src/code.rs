@@ -43,7 +43,8 @@ fn open(a: &mut Args, cfg: &Config) -> Arc<CodeLive> {
     let verbose = a.flag("--verbose") || a.flag("-v");
     let t0 = Instant::now();
     let live = CodeLive::open(cfg.clone(), Some(dir));
-    let fresh = live.snapshot().base.age() < Duration::from_secs(5);
+    // Built by this very call (no cache yet): nothing to catch up on.
+    let fresh = live.just_built();
     if refresh && !fresh {
         live.compact();
     } else if !fresh {

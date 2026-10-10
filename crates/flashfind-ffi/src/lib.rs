@@ -517,7 +517,7 @@ pub unsafe extern "C" fn ff_code_open(roots: *const c_char, cache_dir: *const c_
         .map(std::path::PathBuf::from)
         .unwrap_or_else(flashfind_code::CodeIndex::default_dir);
     let live = CodeLive::open(cfg, Some(cache));
-    if live.snapshot().base.age() > std::time::Duration::from_secs(5) {
+    if !live.just_built() {
         live.recheck();
     }
     Box::into_raw(Box::new(FfCode(live)))

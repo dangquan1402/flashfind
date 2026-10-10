@@ -245,3 +245,19 @@ fn recheck_catches_up_without_events() {
     assert!(live.stats().rewalks - before <= 2, "{}", live.stats().rewalks - before);
     let _ = std::fs::remove_dir_all(home);
 }
+
+#[test]
+fn reopen_right_after_build_still_catches_up() {
+    let (home, live) = world("reopen");
+    assert!(live.just_built());
+    let cfg = live.config().clone();
+    drop(live);
+    std::thread::sleep(Duration::from_millis(2100));
+    put(&home, "dev/alpha/src/seconds_later.rs", "x");
+    let live = CodeLive::open(cfg, Some(home.join(".cache")));
+    assert!(!live.just_built(), "loaded from cache");
+    live.recheck();
+    let mut s = CodeSession::new(live.clone());
+    assert_eq!(find(&mut s, "seconds_later"), vec!["alpha:src/seconds_later.rs"]);
+    let _ = std::fs::remove_dir_all(home);
+}

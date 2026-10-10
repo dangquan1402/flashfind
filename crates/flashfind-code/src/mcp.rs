@@ -5,8 +5,8 @@
 //! Results are compact JSON grouped by repo (repo root once, paths relative
 //! to it) to keep agent context small.
 
-use crate::{CodeIndex, CodeQuery, Config};
-use flashfind_core::{CancelToken, Session};
+use crate::{CodeIndex, CodeLive, CodeQuery, CodeSession, Config, projects_json, result_json};
+use flashfind_core::CancelToken;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -14,12 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct Server {
-    cfg: Config,
-    cache: Option<PathBuf>,
-    max_age: Duration,
-    state: Mutex<(Arc<CodeIndex>, Session)>,
-    rebuilding: Arc<std::sync::atomic::AtomicBool>,
-    fresh: Arc<Mutex<Option<CodeIndex>>>,
+    live: Arc<CodeLive>,
+    sess: Mutex<CodeSession>,
 }
 
 fn tools() -> Value {
@@ -65,7 +61,7 @@ fn tools() -> Value {
         },
         {
             "name": "reindex",
-            "description": "Rediscover projects and rebuild the index now (normally automatic).",
+            "description": "Rediscover projects and rebuild the index now (normally unnecessary: the index follows file changes live).",
             "inputSchema": {"type": "object", "properties": {}}
         }
     ])
@@ -90,62 +86,30 @@ fn parse_age(s: &str) -> Option<i64> {
 }
 
 impl Server {
-    pub fn new(cfg: Config, cache: Option<PathBuf>, max_age: Duration) -> Server {
-        let ci = cache
-            .as_ref()
-            .and_then(|d| CodeIndex::load(d).ok())
-            .filter(|c| c.roots == cfg.roots && c.age() < max_age * 4)
-            .unwrap_or_else(|| {
-                let c = CodeIndex::build(&cfg);
-                if let Some(d) = &cache {
-                    let _ = c.save(d);
-                }
-                c
-            });
-        let idx = ci.idx.clone();
+    /// Open the cached index (or build it) and keep it current: FSEvents on
+    /// macOS, a rebuild every `poll` elsewhere.
+    pub fn new(cfg: Config, cache: Option<PathBuf>, poll: Duration) -> Server {
+        let _ = poll; // see CodeLive::poll (default 300 s)
+        let live = CodeLive::open(cfg, cache);
+        if let Err(e) = live.watch() {
+            eprintln!("flashfind mcp: not watching for changes: {e}");
+        }
+        Server::with_live(live)
+    }
+
+    pub fn with_live(live: Arc<CodeLive>) -> Server {
         Server {
-            cfg,
-            cache,
-            max_age,
-            state: Mutex::new((Arc::new(ci), Session::new(idx))),
-            rebuilding: Arc::default(),
-            fresh: Arc::default(),
+            sess: Mutex::new(CodeSession::new(live.clone())),
+            live,
         }
     }
 
     pub fn from_index(ci: CodeIndex) -> Server {
-        let idx = ci.idx.clone();
-        Server {
-            cfg: Config {
-                roots: ci.roots.clone(),
-                ..Config::default()
-            },
-            cache: None,
-            max_age: Duration::from_secs(u64::MAX / 4),
-            state: Mutex::new((Arc::new(ci), Session::new(idx))),
-            rebuilding: Arc::default(),
-            fresh: Arc::default(),
-        }
-    }
-
-    /// Swap in a finished background rebuild; start one if the index is old.
-    fn refresh(&self) {
-        if let Some(ci) = self.fresh.lock().unwrap().take() {
-            let idx = ci.idx.clone();
-            *self.state.lock().unwrap() = (Arc::new(ci), Session::new(idx));
-        }
-        let old = self.state.lock().unwrap().0.age() >= self.max_age;
-        if old && !self.rebuilding.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            let (cfg, cache, fresh, flag) = (self.cfg.clone(), self.cache.clone(), self.fresh.clone(), self.rebuilding.clone());
-            std::thread::spawn(move || {
-                let c = CodeIndex::build(&cfg);
-                if let Some(d) = &cache {
-                    let _ = c.save(d);
-                }
-                *fresh.lock().unwrap() = Some(c);
-                flag.store(false, std::sync::atomic::Ordering::Release);
-            });
-        }
+        let cfg = Config {
+            roots: ci.roots.clone(),
+            ..Config::default()
+        };
+        Server::with_live(CodeLive::from_index(cfg, ci))
     }
 
     fn call(&self, name: &str, a: &Value) -> Result<Value, String> {
@@ -153,7 +117,6 @@ impl Server {
         let limit = |d: u64| a.get("limit").and_then(Value::as_u64).unwrap_or(d).clamp(1, 200) as usize;
         match name {
             "find_files" => {
-                self.refresh();
                 let mut text = s("query").unwrap_or_default();
                 if text.trim().is_empty() && s("repo").is_none() && s("lang").is_none() && a.get("dirty").is_none() {
                     return Err("query is required (or give repo/lang/dirty to list files)".into());
@@ -169,18 +132,11 @@ impl Server {
                 }
                 let mut cq = CodeQuery::parse(&text);
                 cq.limit = limit(20);
-                let mut g = self.state.lock().unwrap();
-                let (ci, sess) = &mut *g;
-                let r = ci.search(sess, &cq, &CancelToken::new())?;
-                Ok(ci.result_json(&r))
+                let r = self.sess.lock().unwrap().search(&cq, &CancelToken::new())?;
+                Ok(result_json(&r))
             }
-            "list_projects" => {
-                self.refresh();
-                let g = self.state.lock().unwrap();
-                Ok(g.0.projects_json(s("filter").as_deref(), limit(50)))
-            }
+            "list_projects" => Ok(projects_json(&self.live.repos(), s("filter").as_deref(), limit(50))),
             "recent_files" => {
-                self.refresh();
                 let mut text = String::new();
                 if let Some(r) = s("repo") {
                     text.push_str(&format!("repo:{r} "));
@@ -194,19 +150,14 @@ impl Server {
                     Some(w) => Some(parse_age(&w).ok_or_else(|| format!("bad within: {w}"))?),
                     None => Some(7 * 86_400),
                 };
-                let g = self.state.lock().unwrap();
-                let r = g.0.recent(&cq, within)?;
-                Ok(g.0.result_json(&r))
+                let r = self.sess.lock().unwrap().recent(&cq, within)?;
+                Ok(result_json(&r))
             }
             "reindex" => {
-                let c = CodeIndex::build(&self.cfg);
-                if let Some(d) = &self.cache {
-                    let _ = c.save(d);
-                }
-                let info = json!({"repos": c.info.repos, "entries": c.info.entries, "ms": c.info.discover_ms + c.info.crawl_ms + c.info.build_ms});
-                let idx = c.idx.clone();
-                *self.state.lock().unwrap() = (Arc::new(c), Session::new(idx));
-                Ok(info)
+                let t = std::time::Instant::now();
+                self.live.compact();
+                let st = self.live.stats();
+                Ok(json!({"repos": st.repos, "entries": st.entries, "ms": t.elapsed().as_millis() as u64}))
             }
             _ => Err(format!("unknown tool {name}")),
         }

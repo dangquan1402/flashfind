@@ -11,7 +11,10 @@
 //!   boosts recently active repos and groups results by repo.
 //! * [`mcp`] serves it to AI coding agents over MCP (stdio).
 
+pub mod live;
 pub mod mcp;
+
+pub use live::{CodeLive, CodeSession, LiveStats};
 
 use flashfind_core::walk::{KIND_DIR, KIND_FILE, KIND_LINK, KIND_MASK, KIND_OTHER, Listing, NONE};
 use flashfind_core::{CancelToken, Index, Query, Session};
@@ -136,7 +139,7 @@ fn mtime(p: &Path) -> i64 {
 
 /// The git dir of a working tree (`.git` folder, or the target of a
 /// `.git` file for worktrees/submodules).
-fn git_dir(repo: &Path) -> Option<PathBuf> {
+pub(crate) fn git_dir(repo: &Path) -> Option<PathBuf> {
     let g = repo.join(".git");
     let md = std::fs::symlink_metadata(&g).ok()?;
     if md.is_dir() {
@@ -324,10 +327,19 @@ struct Meta {
     roots: Vec<PathBuf>,
     repos: Vec<Repo>,
     info: BuildInfo,
+    /// FSEvents id taken just before the crawl: replay from here.
+    #[serde(default)]
+    event_id: u64,
+    #[serde(default)]
+    root: Option<PathBuf>,
 }
 
 pub struct CodeIndex {
     pub idx: Arc<Index>,
+    /// Folder the index is rooted at (common ancestor of the repos).
+    pub root: PathBuf,
+    /// FSEvents id taken just before this index was crawled.
+    pub event_id: u64,
     /// Sorted by their subtree start in the index.
     pub repos: Vec<Repo>,
     pub roots: Vec<PathBuf>,
@@ -339,8 +351,12 @@ pub struct CodeIndex {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CodeHit {
-    /// Index into [`CodeIndex::repos`].
+    /// Index into the owning [`CodeIndex::repos`] (not meaningful after a
+    /// live merge; use `repo_root`).
     pub repo: usize,
+    pub repo_name: String,
+    pub repo_root: String,
+    pub repo_active: i64,
     pub path: String,
     /// Path relative to the repo root.
     pub rel: String,
@@ -355,8 +371,17 @@ pub struct CodeResult {
     pub hits: Vec<CodeHit>,
     pub total: u64,
     pub elapsed_us: u64,
-    /// (repo, hit indices) in order of each repo's best hit.
-    pub groups: Vec<(usize, Vec<usize>)>,
+    /// Hits grouped by repo, in order of each repo's best hit.
+    pub groups: Vec<Group>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Group {
+    pub repo: String,
+    pub root: String,
+    pub active: i64,
+    /// Indices into `hits`.
+    pub hits: Vec<usize>,
 }
 
 /// A query with code filters split out.
@@ -464,14 +489,23 @@ impl CodeIndex {
     }
 
     /// Index already discovered repos.
-    pub fn build_repos(cfg: &Config, mut repos: Vec<Repo>, discover_ms: f64) -> CodeIndex {
-        let t1 = Instant::now();
+    pub fn build_repos(cfg: &Config, repos: Vec<Repo>, discover_ms: f64) -> CodeIndex {
         let paths: Vec<PathBuf> = repos.iter().map(|r| r.path.clone()).collect();
         let root = if paths.len() == 1 {
             paths[0].parent().unwrap_or(&paths[0]).to_path_buf()
         } else {
             common_root(&paths)
         };
+        CodeIndex::build_repos_at(cfg, repos, &root, discover_ms)
+    }
+
+    /// Index `repos` under a given `root` (an overlay for one repo uses the
+    /// base index's root so paths, depths and priors line up).
+    pub fn build_repos_at(cfg: &Config, mut repos: Vec<Repo>, root: &Path, discover_ms: f64) -> CodeIndex {
+        let event_id = flashfind_core::watch::current_event_id();
+        let t1 = Instant::now();
+        let paths: Vec<PathBuf> = repos.iter().map(|r| r.path.clone()).collect();
+        let root = root.to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<Ent>>();
         if let Some((first, rest)) = paths.split_first() {
             let mut wb = ignore::WalkBuilder::new(first);
@@ -552,10 +586,18 @@ impl CodeIndex {
             built_at: now(),
         };
         repos.sort_by(|a, b| a.path.cmp(&b.path));
-        CodeIndex::assemble(Arc::new(idx), repos, cfg.roots.clone(), info)
+        CodeIndex::assemble(Arc::new(idx), repos, cfg.roots.clone(), info, root, event_id)
     }
 
-    fn assemble(idx: Arc<Index>, mut repos: Vec<Repo>, roots: Vec<PathBuf>, info: BuildInfo) -> CodeIndex {
+    /// Discover + index, remembering the FSEvents id from before discovery.
+    pub fn build_tracked(cfg: &Config) -> CodeIndex {
+        let ev = flashfind_core::watch::current_event_id();
+        let mut ci = CodeIndex::build(cfg);
+        ci.event_id = ev;
+        ci
+    }
+
+    fn assemble(idx: Arc<Index>, mut repos: Vec<Repo>, roots: Vec<PathBuf>, info: BuildInfo, root: PathBuf, event_id: u64) -> CodeIndex {
         for r in &mut repos {
             r.range = match idx.lookup(&pbytes(&r.path)) {
                 Some(e) => (e, idx.end(e)),
@@ -573,6 +615,8 @@ impl CodeIndex {
         }
         CodeIndex {
             idx,
+            root,
+            event_id,
             repos,
             roots,
             info,
@@ -588,6 +632,8 @@ impl CodeIndex {
             roots: self.roots.clone(),
             repos: self.repos.clone(),
             info: self.info.clone(),
+            event_id: self.event_id,
+            root: Some(self.root.clone()),
         };
         let tmp = dir.join("code.json.tmp");
         std::fs::write(&tmp, serde_json::to_vec(&meta).unwrap())?;
@@ -597,7 +643,8 @@ impl CodeIndex {
     pub fn load(dir: &Path) -> std::io::Result<CodeIndex> {
         let idx = Index::load(&dir.join("code.ffx"))?;
         let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("code.json"))?).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(CodeIndex::assemble(Arc::new(idx), meta.repos, meta.roots, meta.info))
+        let root = meta.root.unwrap_or_else(|| PathBuf::from(String::from_utf8_lossy(idx.root()).into_owned()));
+        Ok(CodeIndex::assemble(Arc::new(idx), meta.repos, meta.roots, meta.info, root, meta.event_id))
     }
 
     /// Default cache folder: `$FLASHFIND_CACHE` or `~/.cache/flashfind`.
@@ -703,8 +750,18 @@ impl CodeIndex {
         v
     }
 
-    fn mask(&self, cq: &CodeQuery) -> Result<Vec<u64>, String> {
+    /// Subtree range of repo `i` in the index.
+    pub fn range(&self, i: usize) -> (u32, u32) {
+        self.repos[i].range
+    }
+
+    fn mask(&self, cq: &CodeQuery, extra: Option<&[u64]>) -> Result<Vec<u64>, String> {
         let mut mask = self.outside.clone();
+        if let Some(x) = extra {
+            for (m, e) in mask.iter_mut().zip(x) {
+                *m |= e;
+            }
+        }
         let mut selected: Option<Vec<usize>> = None;
         if !cq.repos.is_empty() {
             let mut v = Vec::new();
@@ -752,10 +809,14 @@ impl CodeIndex {
     fn hit(&self, e: u32, score: i32) -> Option<CodeHit> {
         let repo = self.repo_of(e)?;
         let path = self.idx.path_string(e);
-        let root = self.repos[repo].path.to_string_lossy();
+        let r = &self.repos[repo];
+        let root = r.path.to_string_lossy();
         let rel = path.strip_prefix(root.as_ref()).unwrap_or(&path).trim_start_matches('/').to_string();
         Some(CodeHit {
             repo,
+            repo_name: r.name.clone(),
+            repo_root: root.clone().into_owned(),
+            repo_active: r.active,
             rel: if rel.is_empty() { ".".into() } else { rel },
             path,
             score,
@@ -767,9 +828,14 @@ impl CodeIndex {
 
     /// Search with code filters, recency boost and repo grouping.
     pub fn search(&self, sess: &mut Session, cq: &CodeQuery, cancel: &CancelToken) -> Result<CodeResult, String> {
+        self.search_with(sess, cq, cancel, None)
+    }
+
+    /// [`CodeIndex::search`] with extra excluded entries (live tombstones).
+    pub fn search_with(&self, sess: &mut Session, cq: &CodeQuery, cancel: &CancelToken, extra: Option<&[u64]>) -> Result<CodeResult, String> {
         // Only filters (e.g. `repo:x`, `dirty:`): list matching files, newest first.
         if cq.text.trim().is_empty() {
-            return self.recent(cq, None);
+            return self.recent_with(cq, None, extra);
         }
         let t0 = Instant::now();
         let mut q = Query::parse(&cq.text)?;
@@ -780,7 +846,7 @@ impl CodeIndex {
         let limit = cq.limit.max(1);
         // Fetch extra so the recency boost can reorder within score bands.
         q.limit = (limit * 3).max(30);
-        let mask = self.mask(cq)?;
+        let mask = self.mask(cq, extra)?;
         let r = sess.search_masked(&q, cancel, Some(&mask)).map_err(|e| e.to_string())?;
         let t = now();
         let mut hits: Vec<CodeHit> = r
@@ -806,8 +872,12 @@ impl CodeIndex {
     /// Most recently modified files (optionally in some repos / languages,
     /// modified within `within` seconds).
     pub fn recent(&self, cq: &CodeQuery, within: Option<i64>) -> Result<CodeResult, String> {
+        self.recent_with(cq, within, None)
+    }
+
+    pub fn recent_with(&self, cq: &CodeQuery, within: Option<i64>, extra: Option<&[u64]>) -> Result<CodeResult, String> {
         let t0 = Instant::now();
-        let mask = self.mask(cq)?;
+        let mask = self.mask(cq, extra)?;
         let mut exts: Vec<&str> = Vec::new();
         for l in &cq.langs {
             exts.extend(lang_exts(l).ok_or_else(|| format!("unknown lang:{l}"))?.iter());
@@ -842,7 +912,11 @@ impl CodeIndex {
             cand.truncate(k);
         }
         cand.sort_by(|a, b| b.cmp(a));
-        let hits: Vec<CodeHit> = cand.iter().filter_map(|&(_, e)| self.hit(e, 0)).collect();
+        // Score = seconds since 2001 (fits i32 until 2069), so merged lists stay newest first.
+        let hits: Vec<CodeHit> = cand
+            .iter()
+            .filter_map(|&(m, e)| self.hit(e, (m - 978_307_200).clamp(0, i32::MAX as i64) as i32))
+            .collect();
         let groups = group(&hits);
         Ok(CodeResult {
             hits,
@@ -854,43 +928,50 @@ impl CodeIndex {
 
     /// Compact, agent-friendly JSON: results grouped by repo.
     pub fn result_json(&self, r: &CodeResult) -> serde_json::Value {
-        let groups: Vec<serde_json::Value> = r
-            .groups
-            .iter()
-            .map(|(ri, hs)| {
-                let repo = &self.repos[*ri];
-                serde_json::json!({
-                    "repo": repo.name,
-                    "root": repo.path,
-                    "files": hs.iter().map(|&i| &r.hits[i].rel).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        serde_json::json!({"total": r.total, "shown": r.hits.len(), "us": r.elapsed_us, "groups": groups})
+        result_json(r)
     }
 
     pub fn projects_json(&self, filter: Option<&str>, limit: usize) -> serde_json::Value {
-        let mut v: Vec<&Repo> = self
-            .repos
-            .iter()
-            .filter(|r| filter.is_none_or(|f| r.name.to_ascii_lowercase().contains(&f.to_ascii_lowercase())))
-            .collect();
-        v.sort_by(|a, b| b.active.cmp(&a.active).then(a.name.cmp(&b.name)));
-        let shown: Vec<serde_json::Value> = v
-            .iter()
-            .take(limit)
-            .map(|r| serde_json::json!({"name": r.name, "root": r.path, "branch": r.branch, "last_commit": r.last_commit, "active": r.active, "entries": r.files}))
-            .collect();
-        serde_json::json!({"total": v.len(), "projects": shown})
+        projects_json(&self.repos, filter, limit)
     }
 }
 
-fn group(hits: &[CodeHit]) -> Vec<(usize, Vec<usize>)> {
-    let mut order: Vec<(usize, Vec<usize>)> = Vec::new();
+/// Compact, agent-friendly JSON: results grouped by repo.
+pub fn result_json(r: &CodeResult) -> serde_json::Value {
+    let groups: Vec<serde_json::Value> = r
+        .groups
+        .iter()
+        .map(|g| serde_json::json!({"repo": g.repo, "root": g.root, "files": g.hits.iter().map(|&i| &r.hits[i].rel).collect::<Vec<_>>()}))
+        .collect();
+    serde_json::json!({"total": r.total, "shown": r.hits.len(), "us": r.elapsed_us, "groups": groups})
+}
+
+pub fn projects_json(repos: &[Repo], filter: Option<&str>, limit: usize) -> serde_json::Value {
+    let mut v: Vec<&Repo> = repos
+        .iter()
+        .filter(|r| filter.is_none_or(|f| r.name.to_ascii_lowercase().contains(&f.to_ascii_lowercase())))
+        .collect();
+    v.sort_by(|a, b| b.active.cmp(&a.active).then(a.name.cmp(&b.name)));
+    let shown: Vec<serde_json::Value> = v
+        .iter()
+        .take(limit)
+        .map(|r| serde_json::json!({"name": r.name, "root": r.path, "branch": r.branch, "last_commit": r.last_commit, "active": r.active, "entries": r.files}))
+        .collect();
+    serde_json::json!({"total": v.len(), "projects": shown})
+}
+
+/// Group hits by repo, in order of each repo's best hit.
+pub fn group(hits: &[CodeHit]) -> Vec<Group> {
+    let mut order: Vec<Group> = Vec::new();
     for (i, h) in hits.iter().enumerate() {
-        match order.iter_mut().find(|(r, _)| *r == h.repo) {
-            Some((_, v)) => v.push(i),
-            None => order.push((h.repo, vec![i])),
+        match order.iter_mut().find(|g| g.root == h.repo_root) {
+            Some(g) => g.hits.push(i),
+            None => order.push(Group {
+                repo: h.repo_name.clone(),
+                root: h.repo_root.clone(),
+                active: h.repo_active,
+                hits: vec![i],
+            }),
         }
     }
     order

@@ -443,3 +443,267 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+// ------------------------------------------------------------ code projects
+
+use flashfind_code::{CodeLive, CodeQuery, CodeSession, Config as CodeConfig};
+
+pub struct FfCode(Arc<CodeLive>);
+pub struct FfCodeSession(Mutex<CodeSession>);
+
+#[repr(C)]
+pub struct FfCodeHit {
+    pub path: *const c_char,
+    /// Path relative to the repo root.
+    pub rel: *const c_char,
+    pub repo: *const c_char,
+    pub repo_root: *const c_char,
+    /// Index of this hit's group (repo) in display order.
+    pub group: u32,
+    pub kind: u8,
+    pub score: i32,
+    pub size: u64,
+    pub mtime: i64,
+    /// Repo's last activity (Unix seconds).
+    pub repo_active: i64,
+}
+
+#[repr(C)]
+pub struct FfCodePage {
+    pub hits: *const FfCodeHit,
+    pub count: usize,
+    pub total: u64,
+    pub groups: u32,
+    pub elapsed_us: u64,
+}
+
+pub type FfCodePageCallback = Option<unsafe extern "C" fn(ctx: *mut c_void, page: *const FfCodePage)>;
+
+#[repr(C)]
+#[derive(Default)]
+pub struct FfCodeStats {
+    pub repos: u64,
+    pub entries: u64,
+    pub overlays: u64,
+    pub removed: u64,
+    pub events: u64,
+    pub rewalks: u64,
+    pub repos_added: u64,
+    pub repos_removed: u64,
+    pub compactions: u64,
+    pub last_event_id: u64,
+    pub watching: u8,
+    pub last_apply_ms: f64,
+}
+
+/// Open the code-projects index. `roots`: ':'-separated folders, or NULL for
+/// $FLASHFIND_CODE_ROOTS / ~. `cache_dir`: NULL for ~/.cache/flashfind.
+/// Loads the cache (replaying FSEvents since it was built on macOS) or
+/// discovers + crawls (seconds for a big home): call off the main thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_open(roots: *const c_char, cache_dir: *const c_char, err: *mut *mut c_char) -> *mut FfCode {
+    let mut cfg = CodeConfig::default();
+    if let Some(r) = unsafe { cstr(roots) }
+        && !r.is_empty()
+    {
+        cfg.roots = std::env::split_paths(r).collect();
+    }
+    cfg.roots = cfg.roots.iter().filter_map(|r| std::fs::canonicalize(r).ok()).collect();
+    if cfg.roots.is_empty() {
+        set_err(err, "no existing root folder");
+        return std::ptr::null_mut();
+    }
+    let cache = unsafe { cstr(cache_dir) }
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(flashfind_code::CodeIndex::default_dir);
+    let live = CodeLive::open(cfg, Some(cache));
+    if flashfind_core::watch::native_events() && live.snapshot().base.age() > std::time::Duration::from_secs(5) {
+        live.replay(std::time::Duration::from_secs(3));
+    }
+    Box::into_raw(Box::new(FfCode(live)))
+}
+
+/// Follow file changes (FSEvents on macOS; periodic rebuilds elsewhere).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_watch(c: *const FfCode, err: *mut *mut c_char) -> i32 {
+    let Some(c) = (unsafe { c.as_ref() }) else {
+        set_err(err, "code is NULL");
+        return FF_ERROR;
+    };
+    match c.0.watch() {
+        Ok(()) => FF_OK,
+        Err(e) => {
+            set_err(err, &e.to_string());
+            FF_ERROR
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_unwatch(c: *const FfCode) {
+    if let Some(c) = unsafe { c.as_ref() } {
+        c.0.unwatch();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_stats(c: *const FfCode, out: *mut FfCodeStats) {
+    let (Some(c), Some(out)) = (unsafe { c.as_ref() }, unsafe { out.as_mut() }) else {
+        return;
+    };
+    let s = c.0.stats();
+    *out = FfCodeStats {
+        repos: s.repos as u64,
+        entries: s.entries as u64,
+        overlays: s.overlays as u64,
+        removed: s.removed as u64,
+        events: s.events,
+        rewalks: s.rewalks,
+        repos_added: s.repos_added,
+        repos_removed: s.repos_removed,
+        compactions: s.compactions,
+        last_event_id: s.last_event_id,
+        watching: s.watching as u8,
+        last_apply_ms: s.last_apply_ms,
+    };
+}
+
+/// Projects as JSON (`{total, projects:[…]}`), most recently active first.
+/// Free with ff_string_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_projects_json(c: *const FfCode, filter: *const c_char, limit: u32) -> *mut c_char {
+    let Some(c) = (unsafe { c.as_ref() }) else { return std::ptr::null_mut() };
+    let v = flashfind_code::projects_json(&c.0.repos(), unsafe { cstr(filter) }, if limit == 0 { 1000 } else { limit as usize });
+    CString::new(v.to_string()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+}
+
+/// Fold live changes into a fresh saved base (call before quitting).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_checkpoint(c: *const FfCode) {
+    if let Some(c) = unsafe { c.as_ref() } {
+        c.0.checkpoint();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_free(c: *mut FfCode) {
+    if !c.is_null() {
+        let b = unsafe { Box::from_raw(c) };
+        b.0.unwatch();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_session_new(c: *const FfCode) -> *mut FfCodeSession {
+    match unsafe { c.as_ref() } {
+        Some(c) => Box::into_raw(Box::new(FfCodeSession(Mutex::new(CodeSession::new(c.0.clone()))))),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_session_free(s: *mut FfCodeSession) {
+    if !s.is_null() {
+        drop(unsafe { Box::from_raw(s) });
+    }
+}
+
+/// Code search: the normal query language plus `repo:`, `lang:`, `dirty:`.
+/// A query of filters only lists matching files, newest first. Delivers
+/// the page through `cb` once (pointers valid during the callback only).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_search(
+    s: *mut FfCodeSession,
+    query: *const c_char,
+    limit: u32,
+    cancel: *const FfCancel,
+    cb: FfCodePageCallback,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> i32 {
+    let t0 = std::time::Instant::now();
+    let Some(sess) = (unsafe { s.as_ref() }) else {
+        set_err(err, "session is NULL");
+        return FF_ERROR;
+    };
+    let Some(qs) = (unsafe { cstr(query) }) else {
+        set_err(err, "query is NULL or not UTF-8");
+        return FF_ERROR;
+    };
+    let mut cq = CodeQuery::parse(qs);
+    cq.limit = if limit == 0 { 50 } else { limit as usize };
+    let token = unsafe { cancel.as_ref() }.map(|c| c.0.clone()).unwrap_or_default();
+    let res = {
+        let mut g = sess.0.lock().unwrap_or_else(|p| p.into_inner());
+        if token.is_cancelled() {
+            return FF_CANCELLED;
+        }
+        if cq.text.trim().is_empty() && cq.repos.is_empty() && cq.langs.is_empty() && !cq.dirty {
+            Ok(flashfind_code::CodeResult::default())
+        } else {
+            g.search(&cq, &token)
+        }
+    };
+    let res = match res {
+        Ok(r) => r,
+        Err(_) if token.is_cancelled() => return FF_CANCELLED,
+        Err(e) => {
+            set_err(err, &e);
+            return FF_ERROR;
+        }
+    };
+    if token.is_cancelled() {
+        return FF_CANCELLED;
+    }
+    let cs = |s: &str| CString::new(s.replace('\0', "")).unwrap_or_default();
+    let mut group_of = vec![0u32; res.hits.len()];
+    for (gi, g) in res.groups.iter().enumerate() {
+        for &i in &g.hits {
+            group_of[i] = gi as u32;
+        }
+    }
+    // Display order: by group, then rank within the group.
+    let order: Vec<usize> = res.groups.iter().flat_map(|g| g.hits.iter().copied()).collect();
+    let strs: Vec<[CString; 4]> = order
+        .iter()
+        .map(|&i| {
+            let h = &res.hits[i];
+            [cs(&h.path), cs(&h.rel), cs(&h.repo_name), cs(&h.repo_root)]
+        })
+        .collect();
+    let hits: Vec<FfCodeHit> = order
+        .iter()
+        .zip(&strs)
+        .map(|(&i, st)| {
+            let h = &res.hits[i];
+            FfCodeHit {
+                path: st[0].as_ptr(),
+                rel: st[1].as_ptr(),
+                repo: st[2].as_ptr(),
+                repo_root: st[3].as_ptr(),
+                group: group_of[i],
+                kind: match h.kind {
+                    "file" => 0,
+                    "dir" => 1,
+                    "link" => 2,
+                    _ => 3,
+                },
+                score: h.score,
+                size: h.size,
+                mtime: h.mtime,
+                repo_active: h.repo_active,
+            }
+        })
+        .collect();
+    let page = FfCodePage {
+        hits: hits.as_ptr(),
+        count: hits.len(),
+        total: res.total,
+        groups: res.groups.len() as u32,
+        elapsed_us: t0.elapsed().as_micros() as u64,
+    };
+    if let Some(cb) = cb {
+        unsafe { cb(ctx, &page) };
+    }
+    FF_OK
+}

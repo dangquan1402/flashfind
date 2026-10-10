@@ -89,6 +89,7 @@ dependencies = [
 name = "flashfind-ffi"
 version = "0.1.0"
 dependencies = [
+ "flashfind-code",
  "flashfind-core",
 ]
 

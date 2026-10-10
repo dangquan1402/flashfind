@@ -106,6 +106,57 @@ void ff_live_checkpoint(const ff_live *live);
 ff_session *ff_live_session_new(const ff_live *live);
 void ff_live_free(ff_live *live);
 
+/* ---- Code projects: git repos under your roots, gitignore-aware ------ */
+typedef struct FfCode ff_code;
+typedef struct FfCodeSession ff_code_session;
+
+typedef struct {
+    const char *path;       /* absolute */
+    const char *rel;        /* relative to the repo root */
+    const char *repo;       /* repo (folder) name */
+    const char *repo_root;  /* absolute repo root */
+    uint32_t group;         /* index of the repo group in display order */
+    uint8_t kind;           /* 0 file, 1 dir, 2 symlink, 3 other */
+    int32_t score;
+    uint64_t size;
+    int64_t mtime;
+    int64_t repo_active;    /* repo's last activity, Unix seconds */
+} ff_code_hit;
+
+typedef struct {
+    const ff_code_hit *hits; /* grouped by repo, best group first */
+    size_t count;
+    uint64_t total;
+    uint32_t groups;
+    uint64_t elapsed_us;
+} ff_code_page;
+
+typedef void (*ff_code_page_cb)(void *ctx, const ff_code_page *page);
+
+typedef struct {
+    uint64_t repos, entries, overlays, removed, events, rewalks;
+    uint64_t repos_added, repos_removed, compactions, last_event_id;
+    uint8_t watching;
+    double last_apply_ms;
+} ff_code_stats;
+
+/* roots: ':'-separated or NULL ($FLASHFIND_CODE_ROOTS or ~); cache_dir:
+   NULL for ~/.cache/flashfind. May take seconds the first time: call off
+   the main thread. */
+ff_code *ff_code_open(const char *roots, const char *cache_dir, char **err);
+int32_t ff_code_watch(const ff_code *c, char **err);   /* FSEvents on macOS */
+void ff_code_unwatch(const ff_code *c);
+void ff_code_stats(const ff_code *c, ff_code_stats *out);
+char *ff_code_projects_json(const ff_code *c, const char *filter, uint32_t limit); /* ff_string_free */
+void ff_code_checkpoint(const ff_code *c);
+void ff_code_free(ff_code *c);
+ff_code_session *ff_code_session_new(const ff_code *c);
+void ff_code_session_free(ff_code_session *s);
+/* Query language + repo:/lang:/dirty:. Filters only => files newest first.
+   An empty query delivers an empty page. */
+int32_t ff_code_search(ff_code_session *s, const char *query, uint32_t limit, const ff_cancel *cancel,
+                       ff_code_page_cb cb, void *ctx, char **err);
+
 #ifdef __cplusplus
 }
 #endif

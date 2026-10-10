@@ -2,7 +2,7 @@
 
 use crate::util::{Rng, peak_rss, percentile};
 use crate::{Args, die};
-use flashfind_code::{CodeIndex, CodeQuery, Config};
+use flashfind_code::{CodeIndex, CodeLive, CodeQuery, CodeSession, Config};
 use flashfind_core::walk::ScanOptions;
 use flashfind_core::{CancelToken, Index, Query, Session};
 use serde_json::{Value, json};
@@ -33,33 +33,49 @@ fn config(a: &mut Args) -> Config {
     cfg
 }
 
-/// Load the cached code index if it covers the same roots and is fresh,
-/// else rebuild (and cache) it.
-fn open(a: &mut Args, cfg: &Config) -> CodeIndex {
+/// Open the cached code index for `cfg.roots` (building it if missing) and
+/// bring it up to date: on macOS by replaying FSEvents since it was built;
+/// elsewhere by rebuilding when older than `--max-age` (default 600 s).
+fn open(a: &mut Args, cfg: &Config) -> Arc<CodeLive> {
     let dir = a.opt(&["--cache"]).map(PathBuf::from).unwrap_or_else(CodeIndex::default_dir);
     let max_age = Duration::from_secs(a.num(&["--max-age"], 600u64));
     let refresh = a.flag("--refresh");
-    if !refresh
-        && let Ok(ci) = CodeIndex::load(&dir)
-        && ci.roots == cfg.roots
-        && ci.age() < max_age
-    {
-        return ci;
+    let verbose = a.flag("--verbose") || a.flag("-v");
+    let t0 = Instant::now();
+    let live = CodeLive::open(cfg.clone(), Some(dir));
+    let fresh = live.snapshot().base.age() < Duration::from_secs(5);
+    if refresh && !fresh {
+        live.compact();
+    } else if flashfind_core::watch::native_events() && !fresh {
+        let n = live.replay(Duration::from_secs(3));
+        // A day of drift: fold it into a fresh base once.
+        if live.snapshot().base.age() > Duration::from_secs(86_400) {
+            live.compact();
+        }
+        if verbose {
+            let st = live.stats();
+            eprintln!(
+                "replayed {n} events: {} repos re-walked, {} added, {} removed",
+                st.rewalks, st.repos_added, st.repos_removed
+            );
+        }
+    } else if !fresh && live.snapshot().base.age() > max_age {
+        live.compact();
     }
-    let ci = CodeIndex::build(cfg);
-    if let Err(e) = ci.save(&dir) {
-        eprintln!("flashfind: could not cache index in {}: {e}", dir.display());
+    let info = live.snapshot().base.info.clone();
+    if fresh || refresh || verbose {
+        eprintln!(
+            "{} projects, {} entries (index built in {:.0} ms: discover {:.0} + crawl {:.0} + build {:.0}; ready in {:.0} ms)",
+            live.stats().repos,
+            live.stats().entries,
+            info.discover_ms + info.crawl_ms + info.build_ms,
+            info.discover_ms,
+            info.crawl_ms,
+            info.build_ms,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
     }
-    eprintln!(
-        "indexed {} projects, {} entries in {:.0} ms (discover {:.0} + crawl {:.0} + build {:.0})",
-        ci.info.repos,
-        ci.info.entries,
-        ci.info.discover_ms + ci.info.crawl_ms + ci.info.build_ms,
-        ci.info.discover_ms,
-        ci.info.crawl_ms,
-        ci.info.build_ms
-    );
-    ci
+    live
 }
 
 fn ago(t: i64) -> String {
@@ -78,9 +94,9 @@ pub fn cmd_projects(mut a: Args) {
     let cfg = config(&mut a);
     let json = a.flag("--json");
     let limit = a.num(&["--limit"], 1000usize);
-    let ci = open(&mut a, &cfg);
+    let live = open(&mut a, &cfg);
     let filter = a.rest().first().cloned();
-    let v = ci.projects_json(filter.as_deref(), limit);
+    let v = flashfind_code::projects_json(&live.repos(), filter.as_deref(), limit);
     if json {
         println!("{v}");
         return;
@@ -103,26 +119,26 @@ pub fn cmd_code(mut a: Args) {
     let flat = a.flag("--flat");
     let limit = a.num(&["--limit", "-n"], 20usize);
     let recent = a.opt(&["--recent"]);
-    let ci = open(&mut a, &cfg);
+    let live = open(&mut a, &cfg);
+    let mut sess = CodeSession::new(live.clone());
     let text = a.rest().join(" ");
     let mut cq = CodeQuery::parse(&text);
     cq.limit = limit;
     let r = match &recent {
         Some(w) => {
             let secs = flashfind_core::query::parse_duration(w).unwrap_or_else(|e| die(e));
-            ci.recent(&cq, Some(secs))
+            sess.recent(&cq, Some(secs))
         }
         None => {
             if cq.text.trim().is_empty() && !cq.dirty && cq.langs.is_empty() && cq.repos.is_empty() {
                 die("code needs a query (or --recent 7d)");
             }
-            let mut s = Session::new(ci.idx.clone());
-            ci.search(&mut s, &cq, &CancelToken::new())
+            sess.search(&cq, &CancelToken::new())
         }
     }
     .unwrap_or_else(|e| die(e));
     if json {
-        println!("{}", ci.result_json(&r));
+        println!("{}", flashfind_code::result_json(&r));
         return;
     }
     if flat {
@@ -130,10 +146,9 @@ pub fn cmd_code(mut a: Args) {
             println!("{}", h.path);
         }
     } else {
-        for (ri, hs) in &r.groups {
-            let repo = &ci.repos[*ri];
-            println!("{}  ({}, {})", repo.name, repo.path.display(), ago(repo.active));
-            for &i in hs {
+        for g in &r.groups {
+            println!("{}  ({}, {})", g.repo, g.root, ago(g.active));
+            for &i in &g.hits {
                 println!("    {}", r.hits[i].rel);
             }
         }
@@ -144,8 +159,8 @@ pub fn cmd_code(mut a: Args) {
 pub fn cmd_mcp(mut a: Args) {
     let cfg = config(&mut a);
     let dir = a.opt(&["--cache"]).map(PathBuf::from).unwrap_or_else(CodeIndex::default_dir);
-    let max_age = Duration::from_secs(a.num(&["--max-age"], 300u64));
-    let srv = flashfind_code::mcp::Server::new(cfg, Some(dir), max_age);
+    let poll = Duration::from_secs(a.num(&["--max-age"], 300u64));
+    let srv = flashfind_code::mcp::Server::new(cfg, Some(dir), poll);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     if let Err(e) = srv.serve(stdin.lock(), stdout.lock()) {
@@ -612,3 +627,82 @@ fn code_md(v: &Value) -> String {
 
 #[allow(dead_code)]
 fn _unused(_: &Index) {}
+
+/// Event-to-searchable latency of the live code index: create / rename /
+/// delete temp files in `--dir` (must be inside an indexed repo), wait
+/// until each change shows up in search, then clean up.
+pub fn cmd_bench_live_code(mut a: Args) {
+    let cfg = config(&mut a);
+    let dir = PathBuf::from(a.opt(&["--dir"]).unwrap_or_else(|| die("--dir (inside an indexed repo) is required")));
+    let n = a.num(&["-n"], 10usize);
+    let dir = std::fs::canonicalize(&dir).unwrap_or_else(|e| die(e));
+    let cache = a.opt(&["--cache"]).map(PathBuf::from).unwrap_or_else(CodeIndex::default_dir);
+    let t0 = Instant::now();
+    let live = CodeLive::open(cfg, Some(cache));
+    let replayed = live.replay(Duration::from_secs(3));
+    let ready = t0.elapsed();
+    live.watch().unwrap_or_else(|e| die(e));
+    std::thread::sleep(Duration::from_millis(300));
+    let mut s = CodeSession::new(live.clone());
+    let st = live.stats();
+    eprintln!(
+        "{} repos, {} entries; open + replay ({replayed} events) {:.0} ms",
+        st.repos,
+        st.entries,
+        ready.as_secs_f64() * 1e3
+    );
+    let tag = format!("ffzq{}", std::process::id());
+    let found = |s: &mut CodeSession, name: &str| -> bool {
+        let mut cq = CodeQuery::parse(&format!("={name}"));
+        cq.limit = 5;
+        s.search(&cq, &CancelToken::new()).is_ok_and(|r| !r.hits.is_empty())
+    };
+    let wait = |s: &mut CodeSession, name: &str, want: bool| -> f64 {
+        let t = Instant::now();
+        while found(s, name) != want {
+            if t.elapsed() > Duration::from_secs(10) {
+                return f64::NAN;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let (mut create, mut rename, mut delete, mut search_us) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut created: Vec<PathBuf> = Vec::new();
+    for i in 0..n {
+        let a1 = dir.join(format!("{tag}_a{i}.txt"));
+        let b1 = dir.join(format!("{tag}_b{i}.txt"));
+        std::fs::write(&a1, b"x").unwrap_or_else(|e| die(e));
+        created.push(a1.clone());
+        create.push(wait(&mut s, &format!("{tag}_a{i}.txt"), true));
+        std::fs::rename(&a1, &b1).unwrap();
+        created.push(b1.clone());
+        rename.push(wait(&mut s, &format!("{tag}_b{i}.txt"), true));
+        std::fs::remove_file(&b1).unwrap();
+        delete.push(wait(&mut s, &format!("{tag}_b{i}.txt"), false));
+        let t = Instant::now();
+        let mut cq = CodeQuery::parse("readme");
+        cq.limit = 20;
+        let _ = s.search(&cq, &CancelToken::new());
+        search_us.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    for p in &created {
+        let _ = std::fs::remove_file(p);
+    }
+    live.unwatch();
+    let stat = |v: &mut Vec<f64>| {
+        v.retain(|x| x.is_finite());
+        v.sort_by(f64::total_cmp);
+        (percentile(v, 50.0), v.last().copied().unwrap_or(f64::NAN), v.len())
+    };
+    for (name, v) in [("create", &mut create), ("rename", &mut rename), ("delete", &mut delete)] {
+        let (p50, max, k) = stat(v);
+        println!("{name:<7} -> searchable: p50 {p50:.1} ms, max {max:.1} ms ({k}/{n})");
+    }
+    let (p50, max, _) = stat(&mut search_us);
+    let st = live.stats();
+    println!(
+        "search 'readme' with overlay: p50 {p50:.0} µs, max {max:.0} µs; repo re-walk {:.1} ms (last); {} re-walks",
+        st.last_apply_ms, st.rewalks
+    );
+}

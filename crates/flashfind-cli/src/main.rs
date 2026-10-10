@@ -21,8 +21,10 @@ USAGE (code projects):
   flashfind mcp [--root DIR]... [--max-age SECS]      MCP server on stdio (find_files, list_projects, recent_files)
   flashfind gen-repos --root DIR --repos N [--seed S] --queries FILE
   flashfind bench-code --root DIR --queries FILE [--out JSON --md MD]
+  flashfind bench-live-code --dir DIR-IN-A-REPO [-n N]   change-to-searchable latency (temp files, cleaned up)
   Roots default to $FLASHFIND_CODE_ROOTS or ~ (Library, media and hidden folders skipped);
-  the code index is cached in $FLASHFIND_CACHE or ~/.cache/flashfind (rebuilt when older than --max-age, default 600 s).
+  the code index is cached in $FLASHFIND_CACHE or ~/.cache/flashfind and follows changes live
+  (FSEvents on macOS; elsewhere rebuilt when older than --max-age, default 600 s).
 
 USAGE (whole disk):
   flashfind index <root> [-o FILE] [--threads N] [--portable] [--skip PATH]... [--stats-json FILE]
@@ -122,6 +124,7 @@ fn main() {
         "mcp" => code::cmd_mcp(a),
         "gen-repos" => code::cmd_gen_repos(a),
         "bench-code" => code::cmd_bench_code(a),
+        "bench-live-code" => code::cmd_bench_live_code(a),
         "report" => report::run(a),
         "help" | "-h" | "--help" => {
             if a.rest().first().map(String::as_str) == Some("query") {

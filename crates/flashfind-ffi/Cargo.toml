@@ -12,3 +12,4 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 flashfind-core = { path = "../flashfind-core" }
+flashfind-code = { path = "../flashfind-code" }

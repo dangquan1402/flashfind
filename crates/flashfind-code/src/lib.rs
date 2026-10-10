@@ -695,7 +695,9 @@ impl CodeIndex {
             built_at: now(),
         };
         repos.sort_by(|a, b| a.path.cmp(&b.path));
-        CodeIndex::assemble(Arc::new(idx), repos, cfg.roots.clone(), info, root, event_id)
+        let ci = CodeIndex::assemble(Arc::new(idx), repos, cfg.roots.clone(), info, root, event_id);
+        flashfind_core::release_memory();
+        ci
     }
 
     /// Discover + index, remembering the FSEvents id from before discovery.

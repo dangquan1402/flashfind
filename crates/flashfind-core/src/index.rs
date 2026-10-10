@@ -794,5 +794,9 @@ pub fn build_from_disk(root: &Path, opts: &crate::walk::ScanOptions) -> Index {
     let event_id = crate::watch::current_event_id();
     let ls = crate::walk::scan(&root, opts);
     let refs: Vec<&Listing> = ls.iter().collect();
-    Index::build_refs(&refs, &root, created, event_id)
+    let idx = Index::build_refs(&refs, &root, created, event_id);
+    drop(refs);
+    drop(ls);
+    crate::release_memory();
+    idx
 }

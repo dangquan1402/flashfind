@@ -737,6 +737,7 @@ impl Live {
         drop(st);
         self.compactions.fetch_add(1, Ordering::Relaxed);
         *self.last_compact.lock().unwrap() = Instant::now();
+        crate::release_memory();
         true
     }
 

@@ -41,26 +41,56 @@ impl Token {
     /// Score against a folded name (`orig` = original case, same length).
     #[inline]
     pub fn score(&self, name: &[u8], orig: &[u8]) -> Option<i32> {
+        self.score_sig(name, orig, crate::matcher::bigram_sig(name))
+    }
+
+    #[inline]
+    pub fn score_sig(&self, name: &[u8], orig: &[u8], sig: crate::matcher::Sig) -> Option<i32> {
+        self.score_opt(name, orig, sig, true)
+    }
+
+    /// `typos = false` scores clean (non-typo) matches only.
+    #[inline]
+    pub fn score_opt(
+        &self,
+        name: &[u8],
+        orig: &[u8],
+        sig: crate::matcher::Sig,
+        typos: bool,
+    ) -> Option<i32> {
         use crate::matcher::*;
         let t = &self.pat.text[..];
         match self.mode {
-            Mode::Fuzzy => self.pat.score(name, orig),
+            Mode::Fuzzy if typos => self.pat.score_sig(name, orig, sig),
+            Mode::Fuzzy => self.pat.clean_score(name, orig),
             Mode::Exact => (name == t).then_some(EXACT),
             Mode::Prefix => {
                 if name == t {
                     Some(EXACT)
                 } else if name.starts_with(t) {
-                    Some(PREFIX - ((name.len() - t.len()) as i32).min(40))
+                    Some(PREFIX - prefix_pen(name.len() - t.len()))
                 } else {
                     None
                 }
             }
-            Mode::Suffix => name.ends_with(t).then(|| if name == t { EXACT } else { WORD - ((name.len() - t.len()) as i32).min(40) }),
+            Mode::Suffix => name.ends_with(t).then(|| {
+                if name == t {
+                    EXACT
+                } else {
+                    WORD - ((name.len() - t.len()) as i32).min(40)
+                }
+            }),
             Mode::Substring => {
                 if name == t {
                     Some(EXACT)
                 } else {
-                    memchr::memmem::find(name, t).map(|p| if p == 0 { PREFIX - ((name.len() - t.len()) as i32).min(40) } else { SUBSTR - ((name.len() - t.len()) as i32).min(40) - (p as i32).min(20) })
+                    self.pat.find(name).map(|p| {
+                        if p == 0 {
+                            PREFIX - prefix_pen(name.len() - t.len())
+                        } else {
+                            SUBSTR - ((name.len() - t.len()) as i32).min(40) - (p as i32).min(20)
+                        }
+                    })
                 }
             }
         }
@@ -68,18 +98,50 @@ impl Token {
 }
 
 pub const TYPES: &[(&str, &[&str])] = &[
-    ("image", &["png", "jpg", "jpeg", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg", "raw", "cr2", "cr3", "nef", "arw", "dng", "psd", "ico", "icns", "avif", "jxl"]),
-    ("video", &["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpg", "mpeg", "3gp", "hevc"]),
-    ("audio", &["mp3", "m4a", "aac", "wav", "flac", "aiff", "aif", "ogg", "opus", "alac", "caf", "mid", "midi", "m4r"]),
-    ("doc", &["pdf", "doc", "docx", "pages", "txt", "md", "rtf", "odt", "key", "ppt", "pptx", "numbers", "xls", "xlsx", "csv", "epub", "tex"]),
+    (
+        "image",
+        &[
+            "png", "jpg", "jpeg", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg",
+            "raw", "cr2", "cr3", "nef", "arw", "dng", "psd", "ico", "icns", "avif", "jxl",
+        ],
+    ),
+    (
+        "video",
+        &[
+            "mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpg", "mpeg", "3gp", "hevc",
+        ],
+    ),
+    (
+        "audio",
+        &[
+            "mp3", "m4a", "aac", "wav", "flac", "aiff", "aif", "ogg", "opus", "alac", "caf", "mid",
+            "midi", "m4r",
+        ],
+    ),
+    (
+        "doc",
+        &[
+            "pdf", "doc", "docx", "pages", "txt", "md", "rtf", "odt", "key", "ppt", "pptx",
+            "numbers", "xls", "xlsx", "csv", "epub", "tex",
+        ],
+    ),
     (
         "code",
         &[
-            "rs", "c", "h", "cc", "cpp", "hpp", "m", "mm", "swift", "go", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "java", "kt", "rb", "php", "cs", "sh", "zsh", "bash", "fish", "lua", "sql", "html", "css", "scss", "json", "yaml", "yml", "toml", "xml", "vue", "svelte", "zig", "nim", "hs", "ml", "ex", "exs", "erl",
-            "clj", "dart", "r", "jl", "metal", "glsl", "wgsl", "proto", "graphql", "nix",
+            "rs", "c", "h", "cc", "cpp", "hpp", "m", "mm", "swift", "go", "py", "js", "mjs", "cjs",
+            "ts", "tsx", "jsx", "java", "kt", "rb", "php", "cs", "sh", "zsh", "bash", "fish",
+            "lua", "sql", "html", "css", "scss", "json", "yaml", "yml", "toml", "xml", "vue",
+            "svelte", "zig", "nim", "hs", "ml", "ex", "exs", "erl", "clj", "dart", "r", "jl",
+            "metal", "glsl", "wgsl", "proto", "graphql", "nix",
         ],
     ),
-    ("archive", &["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "dmg", "pkg", "iso", "zst", "lz4", "xip"]),
+    (
+        "archive",
+        &[
+            "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "dmg", "pkg", "iso", "zst", "lz4",
+            "xip",
+        ],
+    ),
     ("font", &["ttf", "otf", "woff", "woff2", "ttc", "dfont"]),
 ];
 
@@ -104,7 +166,16 @@ pub struct Query {
 
 impl Default for Query {
     fn default() -> Self {
-        Query { tokens: Vec::new(), negs: Vec::new(), exts: Vec::new(), kinds: KINDS_ALL, size: (0, u64::MAX), mtime: (i64::MIN, i64::MAX), scope: None, limit: 50 }
+        Query {
+            tokens: Vec::new(),
+            negs: Vec::new(),
+            exts: Vec::new(),
+            kinds: KINDS_ALL,
+            size: (0, u64::MAX),
+            mtime: (i64::MIN, i64::MAX),
+            scope: None,
+            limit: 50,
+        }
     }
 }
 
@@ -117,8 +188,14 @@ pub struct Clock {
 
 impl Clock {
     pub fn system() -> Clock {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        Clock { now, utc_offset: local_offset(now) }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Clock {
+            now,
+            utc_offset: local_offset(now),
+        }
     }
 }
 
@@ -156,7 +233,10 @@ impl Query {
     }
 
     fn push_word(&mut self, w: &str) {
-        if let Some(rest) = w.strip_prefix('!').or_else(|| w.strip_prefix('-').filter(|r| !r.is_empty())) {
+        if let Some(rest) = w
+            .strip_prefix('!')
+            .or_else(|| w.strip_prefix('-').filter(|r| !r.is_empty()))
+        {
             if !rest.is_empty() {
                 self.negs.push(fold_all(rest.as_bytes()));
             }
@@ -186,15 +266,28 @@ impl Query {
             return;
         }
         let folded = fold_all(text.as_bytes());
-        self.tokens.push(Token { mode, pat: Pattern::new(&folded, mode == Mode::Fuzzy) });
+        self.tokens.push(Token {
+            mode,
+            pat: Pattern::new(&folded, mode == Mode::Fuzzy),
+        });
     }
 
     /// Returns Ok(false) if `k` is not a filter (the word is then a token).
-    fn filter(&mut self, k: &str, v: &str, clock: Clock, home: Option<&str>) -> Result<bool, String> {
+    fn filter(
+        &mut self,
+        k: &str,
+        v: &str,
+        clock: Clock,
+        home: Option<&str>,
+    ) -> Result<bool, String> {
         use crate::walk::*;
         match k {
             "ext" => {
-                self.exts.extend(v.split(',').map(|e| fold_all(e.trim_start_matches('.').as_bytes())).filter(|e| !e.is_empty()));
+                self.exts.extend(
+                    v.split(',')
+                        .map(|e| fold_all(e.trim_start_matches('.').as_bytes()))
+                        .filter(|e| !e.is_empty()),
+                );
             }
             "type" | "kind" => {
                 let v = v.to_ascii_lowercase();
@@ -207,7 +300,9 @@ impl Query {
                         self.exts.push(b"app".to_vec());
                     }
                     g => {
-                        let Some((_, exts)) = TYPES.iter().find(|(n, _)| *n == g) else { return Err(format!("unknown type: {v}")) };
+                        let Some((_, exts)) = TYPES.iter().find(|(n, _)| *n == g) else {
+                            return Err(format!("unknown type: {v}"));
+                        };
                         self.kinds = 1 << KIND_FILE;
                         self.exts.extend(exts.iter().map(|e| e.as_bytes().to_vec()));
                     }
@@ -225,7 +320,12 @@ impl Query {
                 }
                 self.scope = Some(p.into_bytes());
             }
-            "limit" => self.limit = v.parse::<usize>().map_err(|_| format!("bad limit: {v}"))?.clamp(1, 100_000),
+            "limit" => {
+                self.limit = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("bad limit: {v}"))?
+                    .clamp(1, 100_000)
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -245,7 +345,11 @@ impl Query {
 
 fn split_range(v: &str) -> (Option<&str>, Option<&str>, &'static str) {
     if let Some((a, b)) = v.split_once("..") {
-        return (Some(a).filter(|s| !s.is_empty()), Some(b).filter(|s| !s.is_empty()), "..");
+        return (
+            Some(a).filter(|s| !s.is_empty()),
+            Some(b).filter(|s| !s.is_empty()),
+            "..",
+        );
     }
     for op in [">=", "<=", ">", "<", "="] {
         if let Some(r) = v.strip_prefix(op) {
@@ -257,7 +361,9 @@ fn split_range(v: &str) -> (Option<&str>, Option<&str>, &'static str) {
 
 pub fn parse_size(v: &str) -> Result<u64, String> {
     let v = v.trim().to_ascii_lowercase();
-    let split = v.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(v.len());
+    let split = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(v.len());
     let (num, unit) = v.split_at(split);
     let mult: f64 = match unit {
         "" | "b" => 1.0,
@@ -273,13 +379,20 @@ pub fn parse_size(v: &str) -> Result<u64, String> {
     };
     let n: f64 = num.parse().map_err(|_| format!("bad size: {v}"))?;
     let bytes = n * mult;
-    Ok(if bytes >= u64::MAX as f64 { u64::MAX } else { bytes.max(0.0) as u64 })
+    Ok(if bytes >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        bytes.max(0.0) as u64
+    })
 }
 
 pub fn parse_size_range(v: &str) -> Result<(u64, u64), String> {
     let (a, b, op) = split_range(v);
     Ok(match op {
-        ".." => (a.map(parse_size).transpose()?.unwrap_or(0), b.map(parse_size).transpose()?.unwrap_or(u64::MAX)),
+        ".." => (
+            a.map(parse_size).transpose()?.unwrap_or(0),
+            b.map(parse_size).transpose()?.unwrap_or(u64::MAX),
+        ),
         ">" => (parse_size(a.unwrap_or(""))?.saturating_add(1), u64::MAX),
         ">=" | "" => (parse_size(a.unwrap_or(""))?, u64::MAX),
         "<" => (0, parse_size(a.unwrap_or(""))?.saturating_sub(1)),
@@ -330,7 +443,11 @@ fn parse_date(v: &str, clock: Clock) -> Option<(i64, i64)> {
     let y: i64 = it.next()?.parse().ok()?;
     let m: i64 = it.next().map_or(Some(1), |s| s.parse().ok())?;
     let d: i64 = it.next().map_or(Some(1), |s| s.parse().ok())?;
-    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) || !(1..=9999).contains(&y) {
+    if it.next().is_some()
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+        || !(1..=9999).contains(&y)
+    {
         return None;
     }
     let start = days_from_civil(y, m, d) * 86_400 - clock.utc_offset;
@@ -368,7 +485,10 @@ pub fn parse_mtime(v: &str, clock: Clock) -> Result<(i64, i64), String> {
     let any = |s: Option<&str>| s.is_some_and(is_date);
     if any(a) || any(b) {
         return Ok(match op {
-            ".." => (a.map(date).transpose()?.map_or(i64::MIN, |r| r.0), b.map(date).transpose()?.map_or(i64::MAX, |r| r.1 - 1)),
+            ".." => (
+                a.map(date).transpose()?.map_or(i64::MIN, |r| r.0),
+                b.map(date).transpose()?.map_or(i64::MAX, |r| r.1 - 1),
+            ),
             ">" => (date(a.unwrap())?.1, i64::MAX),
             ">=" => (date(a.unwrap())?.0, i64::MAX),
             "<" => (i64::MIN, date(a.unwrap())?.0 - 1),
@@ -397,7 +517,10 @@ pub fn parse_mtime(v: &str, clock: Clock) -> Result<(i64, i64), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const CLOCK: Clock = Clock { now: 1_790_000_000, utc_offset: 7 * 3600 };
+    const CLOCK: Clock = Clock {
+        now: 1_790_000_000,
+        utc_offset: 7 * 3600,
+    };
 
     fn q(s: &str) -> Query {
         Query::parse_with(s, CLOCK, Some("/Users/me")).unwrap()
@@ -406,7 +529,11 @@ mod tests {
     #[test]
     fn tokens_and_modes() {
         let x = q("foo ^bar baz$ 'qux =exact ^whole$ !neg -neg2 src/main");
-        let modes: Vec<_> = x.tokens.iter().map(|t| (t.mode, String::from_utf8_lossy(t.text()).into_owned())).collect();
+        let modes: Vec<_> = x
+            .tokens
+            .iter()
+            .map(|t| (t.mode, String::from_utf8_lossy(t.text()).into_owned()))
+            .collect();
         assert_eq!(
             modes,
             vec![
@@ -489,6 +616,9 @@ mod tests {
 
     #[test]
     fn scope() {
-        assert_eq!(q("in:~/Documents/ x").scope.as_deref(), Some(&b"/Users/me/Documents"[..]));
+        assert_eq!(
+            q("in:~/Documents/ x").scope.as_deref(),
+            Some(&b"/Users/me/Documents"[..])
+        );
     }
 }

@@ -10,17 +10,17 @@
 //! distinct name) with a 64-bit character-class mask, and an inverted
 //! name → entries list lets a query score each distinct name once.
 //!
-//! On-disk format `FFIDX001` (native endian, little-endian on every
+//! On-disk format `FFIDX003` (native endian, little-endian on every
 //! supported target): 8-byte magic, `u64` header words, then sections.
 
-use crate::matcher::{class_mask, fold};
+use crate::matcher::{bigram_sig, class_mask, fold};
 use crate::walk::{FLAG_HIDDEN, KIND_DIR, KIND_MASK, Listing, NONE};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"FFIDX001";
+const MAGIC: &[u8; 8] = b"FFIDX003";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -41,8 +41,9 @@ enum S {
     EntEnd,
     DirEntry,
     Root,
+    NameBigram,
 }
-const NSECT: usize = 16;
+const NSECT: usize = 17;
 /// Header: magic + [n, u, d, created] + NSECT × (offset, len) in u64 words.
 const HDR_WORDS: usize = 1 + 4 + NSECT * 2;
 
@@ -54,7 +55,9 @@ enum Buf {
 impl Buf {
     fn bytes(&self) -> &[u8] {
         match self {
-            Buf::Owned(v) => unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8) },
+            Buf::Owned(v) => unsafe {
+                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 8)
+            },
             Buf::Mapped(m) => m,
         }
     }
@@ -98,7 +101,8 @@ impl Hasher for Fx {
         let mut h = self.0;
         let mut c = bytes.chunks_exact(8);
         for w in &mut c {
-            h = (h.rotate_left(5) ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+            h = (h.rotate_left(5) ^ u64::from_le_bytes(w.try_into().unwrap()))
+                .wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
         }
         for &b in c.remainder() {
             h = (h.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
@@ -109,10 +113,37 @@ impl Hasher for Fx {
 
 /// Folder names whose subtrees are mostly noise for a person searching.
 const NOISY: &[&[u8]] = &[
-    b"node_modules", b".git", b".svn", b".hg", b"target", b"deriveddata", b"caches", b".cache", b"__pycache__", b".npm", b".cargo", b".rustup", b"site-packages", b".gradle", b".m2", b"pods", b".venv", b"venv", b".tox", b"build", b"dist", b".next", b"vendor", b"bower_components", b".terraform",
+    b"node_modules",
+    b".git",
+    b".svn",
+    b".hg",
+    b"target",
+    b"deriveddata",
+    b"caches",
+    b".cache",
+    b"__pycache__",
+    b".npm",
+    b".cargo",
+    b".rustup",
+    b"site-packages",
+    b".gradle",
+    b".m2",
+    b"pods",
+    b".venv",
+    b"venv",
+    b".tox",
+    b"build",
+    b"dist",
+    b".next",
+    b"vendor",
+    b"bower_components",
+    b".terraform",
 ];
 /// Top-level system folders when indexing `/`.
-const SYSTEM: &[&[u8]] = &[b"system", b"private", b"usr", b"bin", b"sbin", b"opt", b"cores", b"dev", b"library", b"volumes"];
+const SYSTEM: &[&[u8]] = &[
+    b"system", b"private", b"usr", b"bin", b"sbin", b"opt", b"cores", b"dev", b"library",
+    b"volumes",
+];
 
 /// Static location prior, in [-50, 40] so it never crosses a score band.
 fn own_penalty(folded: &[u8], kind: u8, depth: u32, root_is_slash: bool) -> (i32, i32) {
@@ -150,7 +181,13 @@ impl Builder {
         let off = self.words.len() * 8;
         let add = bytes.div_ceil(8);
         self.words.resize(self.words.len() + add, 0);
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, (self.words.as_mut_ptr() as *mut u8).add(off), bytes) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                (self.words.as_mut_ptr() as *mut u8).add(off),
+                bytes,
+            )
+        };
         self.sect[s as usize] = (off, data.len());
     }
 }
@@ -177,6 +214,17 @@ impl Index {
         self.get(S::NameMask)
     }
     /// Name ids in lexicographic (folded) order.
+    /// Hashed bigram signature per name (typo prefilter).
+    pub fn name_bigram(&self) -> &[u64] {
+        self.get(S::NameBigram)
+    }
+    /// Bigram signature of name id `id`.
+    #[inline(always)]
+    pub fn sig(&self, id: u32) -> crate::matcher::Sig {
+        let b = self.name_bigram();
+        let i = id as usize * 2;
+        (b[i] as u128) | ((b[i + 1] as u128) << 64)
+    }
     pub fn name_sorted(&self) -> &[u32] {
         self.get(S::NameSorted)
     }
@@ -273,7 +321,10 @@ impl Index {
     pub fn rel_path(&self, e: u32) -> String {
         let full = self.path_string(e);
         let root = String::from_utf8_lossy(self.root()).into_owned();
-        full.strip_prefix(&root).unwrap_or(&full).trim_start_matches('/').to_string()
+        full.strip_prefix(&root)
+            .unwrap_or(&full)
+            .trim_start_matches('/')
+            .to_string()
     }
 
     pub fn depth(&self, e: u32) -> u32 {
@@ -315,7 +366,9 @@ impl Index {
         }
         let mut e = 0u32;
         for comp in rest.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
-            e = self.children(e).find(|&c| self.orig(self.ent_name()[c as usize]) == comp)?;
+            e = self
+                .children(e)
+                .find(|&c| self.orig(self.ent_name()[c as usize]) == comp)?;
         }
         Some(e)
     }
@@ -352,8 +405,13 @@ impl Index {
         };
         // SAFETY: listings live in `by_id` until the end of this function;
         // the 'static borrow never escapes it (names are copied out below).
-        let st = |b: &[u8]| -> &'static [u8] { unsafe { std::mem::transmute::<&[u8], &'static [u8]>(b) } };
-        let root_name: Vec<u8> = root.file_name().map(|n| path_bytes(Path::new(n))).unwrap_or_else(|| b"/".to_vec());
+        let st = |b: &[u8]| -> &'static [u8] {
+            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(b) }
+        };
+        let root_name: Vec<u8> = root
+            .file_name()
+            .map(|n| path_bytes(Path::new(n)))
+            .unwrap_or_else(|| b"/".to_vec());
         let root_name_static = st(&root_name);
         ent_name.push(id_of(root_name_static, &mut names));
         ent_parent.push(NONE);
@@ -415,7 +473,17 @@ impl Index {
             name_off.push(name_orig.len() as u32);
         }
         let name_lower: Vec<u8> = name_orig.par_iter().map(|&b| fold(b)).collect();
-        let name_mask: Vec<u64> = (0..u).into_par_iter().map(|i| class_mask(&name_lower[name_off[i] as usize..name_off[i + 1] as usize])).collect();
+        let name_mask: Vec<u64> = (0..u)
+            .into_par_iter()
+            .map(|i| class_mask(&name_lower[name_off[i] as usize..name_off[i + 1] as usize]))
+            .collect();
+        let name_bigram: Vec<u64> = (0..u)
+            .into_par_iter()
+            .flat_map_iter(|i| {
+                let s = bigram_sig(&name_lower[name_off[i] as usize..name_off[i + 1] as usize]);
+                [s as u64, (s >> 64) as u64]
+            })
+            .collect();
         let mut name_sorted: Vec<u32> = (0..u as u32).collect();
         name_sorted.par_sort_unstable_by(|&a, &b| {
             let la = &name_lower[name_off[a as usize] as usize..name_off[a as usize + 1] as usize];
@@ -438,7 +506,10 @@ impl Index {
         }
         let d = dir_entry.len();
         drop(intern);
-        let mut b = Builder { words: vec![0u64; HDR_WORDS], sect: [(0, 0); NSECT] };
+        let mut b = Builder {
+            words: vec![0u64; HDR_WORDS],
+            sect: [(0, 0); NSECT],
+        };
         b.put(S::NameLower, &name_lower);
         b.put(S::NameOrig, &name_orig);
         b.put(S::NameOff, &name_off);
@@ -455,6 +526,7 @@ impl Index {
         b.put(S::EntEnd, &ent_end);
         b.put(S::DirEntry, &dir_entry);
         b.put(S::Root, &root_b);
+        b.put(S::NameBigram, &name_bigram);
         drop(names);
         drop(by_id);
         let mut words = b.words;
@@ -467,11 +539,23 @@ impl Index {
             words[5 + i * 2] = off as u64;
             words[6 + i * 2] = len as u64;
         }
-        Index { buf: Buf::Owned(words), sect: b.sect, n, u, d, created }
+        Index {
+            buf: Buf::Owned(words),
+            sect: b.sect,
+            n,
+            u,
+            d,
+            created,
+        }
     }
 
     pub fn stats(&self) -> BuildStats {
-        BuildStats { entries: self.n, names: self.u, dirs: self.d, bytes: self.bytes() }
+        BuildStats {
+            entries: self.n,
+            names: self.u,
+            dirs: self.d,
+            bytes: self.bytes(),
+        }
     }
 
     /// Atomic save (temp file + rename).
@@ -493,27 +577,47 @@ impl Index {
     pub fn load(path: &Path) -> std::io::Result<Index> {
         let f = std::fs::File::open(path)?;
         let m = unsafe { memmap2::Mmap::map(&f)? };
-        let bad = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {why}", path.display()));
+        let bad = |why: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: {why}", path.display()),
+            )
+        };
         if m.len() < HDR_WORDS * 8 || &m[..8] != MAGIC {
             return Err(bad("not a flashfind index (or an older format)"));
         }
         let w = |i: usize| u64::from_ne_bytes(m[i * 8..i * 8 + 8].try_into().unwrap());
         let mut sect = [(0usize, 0usize); NSECT];
-        let sizes = [1usize, 1, 4, 8, 4, 4, 4, 4, 4, 1, 1, 8, 8, 4, 4, 1];
+        let sizes = [1usize, 1, 4, 8, 4, 4, 4, 4, 4, 1, 1, 8, 8, 4, 4, 1, 8];
         for i in 0..NSECT {
             let (off, len) = (w(5 + i * 2) as usize, w(6 + i * 2) as usize);
-            if off % 8 != 0 || off.checked_add(len.saturating_mul(sizes[i])).is_none_or(|end| end > m.len()) {
+            if off % 8 != 0
+                || off
+                    .checked_add(len.saturating_mul(sizes[i]))
+                    .is_none_or(|end| end > m.len())
+            {
                 return Err(bad("corrupt section table"));
             }
             sect[i] = (off, len);
         }
         let (n, u, d, created) = (w(1) as usize, w(2) as usize, w(3) as usize, w(4) as i64);
-        if sect[S::EntName as usize].1 != n || sect[S::NameOff as usize].1 != u + 1 || sect[S::DirEntry as usize].1 != d {
+        if sect[S::EntName as usize].1 != n
+            || sect[S::NameOff as usize].1 != u + 1
+            || sect[S::NameBigram as usize].1 != 2 * u
+            || sect[S::DirEntry as usize].1 != d
+        {
             return Err(bad("inconsistent counts"));
         }
         #[cfg(unix)]
         let _ = m.advise(memmap2::Advice::WillNeed);
-        Ok(Index { buf: Buf::Mapped(m), sect, n, u, d, created })
+        Ok(Index {
+            buf: Buf::Mapped(m),
+            sect,
+            n,
+            u,
+            d,
+            created,
+        })
     }
 
     /// Touch every page so the first query does not pay page faults.
@@ -541,6 +645,9 @@ pub(crate) fn path_bytes(p: &Path) -> Vec<u8> {
 pub fn build_from_disk(root: &Path, opts: &crate::walk::ScanOptions) -> Index {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let ls = crate::walk::scan(&root, opts);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     Index::build(ls, &root, now)
 }

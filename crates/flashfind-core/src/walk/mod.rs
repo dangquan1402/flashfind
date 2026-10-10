@@ -53,7 +53,14 @@ impl Listing {
         if name.is_empty() || name.len() > u16::MAX as usize {
             return None;
         }
-        self.ents.push(RawEnt { name_off: self.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
+        self.ents.push(RawEnt {
+            name_off: self.names.len() as u32,
+            name_len: name.len() as u16,
+            kind,
+            size,
+            mtime,
+            child: NONE,
+        });
         self.names.extend_from_slice(name);
         Some(self.ents.len() - 1)
     }
@@ -68,13 +75,18 @@ pub struct ScanOptions {
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        ScanOptions { threads: 8, skip: Vec::new() }
+        ScanOptions {
+            threads: 8,
+            skip: Vec::new(),
+        }
     }
 }
 
 impl ScanOptions {
     pub(crate) fn skipped(&self, path: &[u8]) -> bool {
-        self.skip.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/'))
+        self.skip
+            .iter()
+            .any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/'))
     }
 }
 
@@ -98,7 +110,11 @@ pub fn scan_portable(root: &Path, opts: &ScanOptions) -> Vec<Listing> {
 
 /// Name of the backend [`scan`] uses.
 pub fn backend() -> &'static str {
-    if cfg!(target_os = "macos") { "getattrlistbulk" } else { "read_dir" }
+    if cfg!(target_os = "macos") {
+        "getattrlistbulk"
+    } else {
+        "read_dir"
+    }
 }
 
 pub(crate) struct Sink {
@@ -108,17 +124,26 @@ pub(crate) struct Sink {
 
 impl Sink {
     pub fn new(threads: usize) -> Sink {
-        Sink { next_id: std::sync::atomic::AtomicU32::new(1), out: (0..threads + 1).map(|_| Default::default()).collect() }
+        Sink {
+            next_id: std::sync::atomic::AtomicU32::new(1),
+            out: (0..threads + 1).map(|_| Default::default()).collect(),
+        }
     }
     pub fn push(&self, l: Listing) {
-        let slot = rayon::current_thread_index().unwrap_or(self.out.len() - 1).min(self.out.len() - 1);
+        let slot = rayon::current_thread_index()
+            .unwrap_or(self.out.len() - 1)
+            .min(self.out.len() - 1);
         self.out[slot].lock().unwrap().push(l);
     }
     pub fn id(&self) -> u32 {
-        self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
     pub fn finish(self) -> Vec<Listing> {
-        self.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
+        self.out
+            .into_iter()
+            .flat_map(|m| m.into_inner().unwrap())
+            .collect()
     }
 }
 

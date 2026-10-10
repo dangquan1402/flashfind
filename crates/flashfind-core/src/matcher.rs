@@ -9,14 +9,14 @@
 //! |---------------------------|------------------|
 //! | exact name                | 1000             |
 //! | exact stem (`name.ext`)   | 900 − ≤10        |
-//! | prefix                    | 800 − ≤40        |
+//! | prefix                    | 800 − ≤99        |
 //! | substring at word start   | 700 − ≤40        |
 //! | substring                 | 600 − ≤60        |
 //! | fuzzy subsequence         | 60 ..= 560       |
 //! | typo (OSA distance 1 / 2) | ≤ 480 / ≤ 360    |
 //!
 //! Typo tolerance uses a bit-parallel optimal-string-alignment (Damerau)
-//! distance (Hyyrö 2003): a token of 4–7 bytes forgives one edit, 8+ bytes
+//! distance (Hyyrö 2003): a token of 5–8 bytes forgives one edit, 9+ bytes
 //! two, *anywhere* in the word – including the first character and adjacent
 //! swaps, which fsearch does not forgive.
 
@@ -51,12 +51,25 @@ pub fn class_mask(folded: &[u8]) -> u64 {
     folded.iter().fold(0, |m, &b| m | class_bit(b))
 }
 
+/// 128-bit hashed signature of the byte bigrams in a folded name.
+pub type Sig = u128;
+
+#[inline]
+pub fn bigram_bit(a: u8, b: u8) -> Sig {
+    let h = ((a as u32) << 8 | b as u32).wrapping_mul(0x9E37_79B1);
+    1u128 << (h >> 25)
+}
+
+pub fn bigram_sig(folded: &[u8]) -> Sig {
+    folded.windows(2).fold(0, |m, w| m | bigram_bit(w[0], w[1]))
+}
+
 /// Edits forgiven for a token of `len` bytes.
 pub fn typo_budget(len: usize) -> u8 {
     match len {
-        0..=3 => 0,
-        4..=7 => 1,
-        8..=64 => 2,
+        0..=4 => 0,
+        5..=8 => 1,
+        9..=64 => 2,
         _ => 0,
     }
 }
@@ -85,6 +98,14 @@ fn len_pen(extra: usize, cap: i32) -> i32 {
     (extra as i32).min(cap)
 }
 
+/// Prefix band penalty: 4 per extra byte, capped so the band stays above
+/// every word/substring score. Steep on purpose – for short prefixes, short
+/// names should win, and it lets the prefix early exit stop sooner.
+#[inline]
+pub fn prefix_pen(extra: usize) -> i32 {
+    (extra as i32 * 4).min(PREFIX - WORD - 1)
+}
+
 #[inline(always)]
 fn is_alnum(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b >= 0x80
@@ -98,7 +119,9 @@ fn boundary(orig: &[u8], p: usize) -> bool {
         return true;
     }
     let (a, b) = (orig[p - 1], orig[p]);
-    !is_alnum(a) || (a.is_ascii_lowercase() && b.is_ascii_uppercase()) || (a.is_ascii_alphabetic() != b.is_ascii_alphabetic() && is_alnum(b))
+    !is_alnum(a)
+        || (a.is_ascii_lowercase() && b.is_ascii_uppercase())
+        || (a.is_ascii_alphabetic() != b.is_ascii_alphabetic() && is_alnum(b))
 }
 
 /// Precomputed per-token matcher state.
@@ -108,11 +131,25 @@ pub struct Pattern {
     pub mask: u64,
     pub typos: u8,
     peq: Option<Box<[u64; 256]>>,
+    finder: memchr::memmem::Finder<'static>,
+    /// Bigram signature and the minimum number of its bits a name must
+    /// share to be within `typos` edits (each OSA edit destroys ≤ 3 bigram
+    /// occurrences, so ≤ 3 signature bits).
+    bigrams: Sig,
+    min_bigrams: u32,
+    /// Bigram signatures of 2k+1 pieces of the token: with ≤ k OSA edits at
+    /// least one piece survives verbatim (an edit touches ≤ 2 pieces), so a
+    /// candidate name must contain all bigrams of some piece.
+    pieces: Vec<Sig>,
 }
 
 impl Pattern {
     pub fn new(folded: &[u8], allow_typos: bool) -> Pattern {
-        let typos = if allow_typos { typo_budget(folded.len()) } else { 0 };
+        let typos = if allow_typos {
+            typo_budget(folded.len())
+        } else {
+            0
+        };
         let peq = (typos > 0).then(|| {
             let mut t = Box::new([0u64; 256]);
             for (i, &c) in folded.iter().enumerate() {
@@ -120,45 +157,99 @@ impl Pattern {
             }
             t
         });
-        Pattern { text: folded.to_vec(), mask: class_mask(folded), typos, peq }
+        let bigrams = bigram_sig(folded);
+        let min_bigrams = bigrams.count_ones().saturating_sub(3 * typos as u32);
+        let np = 2 * typos as usize + 1;
+        let pieces = if typos > 0 && folded.len() >= 2 * np {
+            (0..np)
+                .map(|i| bigram_sig(&folded[i * folded.len() / np..(i + 1) * folded.len() / np]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Pattern {
+            text: folded.to_vec(),
+            mask: class_mask(folded),
+            typos,
+            peq,
+            finder: memchr::memmem::Finder::new(folded).into_owned(),
+            bigrams,
+            min_bigrams,
+            pieces,
+        }
     }
 
-    /// Full fuzzy score (bands above) or `None`.
-    pub fn score(&self, name: &[u8], orig: &[u8]) -> Option<i32> {
+    #[inline]
+    pub fn find(&self, hay: &[u8]) -> Option<usize> {
+        self.finder.find(hay)
+    }
+
+    /// Cheap check whether the typo path could possibly succeed.
+    #[inline(always)]
+    pub fn typo_candidate(&self, name_bigrams: Sig) -> bool {
+        self.typos > 0
+            && (self.bigrams & name_bigrams).count_ones() >= self.min_bigrams
+            && (self.pieces.is_empty() || self.pieces.iter().any(|&p| p & name_bigrams == p))
+    }
+
+    /// Clean (non-typo) score; `None` if the token is not a subsequence.
+    #[inline]
+    pub fn clean_score(&self, name: &[u8], orig: &[u8]) -> Option<i32> {
         let t = &self.text[..];
         let (m, n) = (t.len(), name.len());
         if m == 0 {
             return Some(0);
         }
-        if m <= n {
-            if name == t {
-                return Some(EXACT);
-            }
-            if name.starts_with(t) {
-                if name[m] == b'.' && !name[m + 1..].contains(&b'.') {
-                    return Some(STEM - len_pen(n - m - 1, 10));
-                }
-                return Some(PREFIX - len_pen(n - m, 40));
-            }
-            if let Some(s) = self.substr(name, orig) {
-                return Some(s);
-            }
+        if m > n || !is_subsequence(t, name) {
+            return None;
         }
-        let fz = fuzzy(t, name, orig);
-        if self.typos > 0 && fz.is_none_or(|s| s < TYPO1) {
-            if let Some(ts) = self.typo(name) {
-                return Some(fz.map_or(ts, |f| f.max(ts)));
-            }
+        if name == t {
+            return Some(EXACT);
         }
-        fz
+        if name.starts_with(t) {
+            if name[m] == b'.' && !name[m + 1..].contains(&b'.') {
+                return Some(STEM - len_pen(n - m - 1, 10));
+            }
+            return Some(PREFIX - prefix_pen(n - m));
+        }
+        if let Some(s) = self.substr(name, orig) {
+            return Some(s);
+        }
+        fuzzy(t, name, orig)
+    }
+
+    /// Score with the name's bigram signature available (fast path used by
+    /// the search engine).
+    #[inline]
+    pub fn score_sig(&self, name: &[u8], orig: &[u8], name_bigrams: Sig) -> Option<i32> {
+        let clean = self.clean_score(name, orig);
+        if clean.is_some_and(|c| c >= TYPO1 + 30)
+            || name.len() + (self.typos as usize) < self.text.len()
+            || !self.typo_candidate(name_bigrams)
+        {
+            return clean;
+        }
+        match self.typo(name) {
+            Some(ts) => Some(clean.map_or(ts, |c| c.max(ts))),
+            None => clean,
+        }
+    }
+
+    /// Full fuzzy score (bands above) or `None`.
+    pub fn score(&self, name: &[u8], orig: &[u8]) -> Option<i32> {
+        self.score_sig(name, orig, bigram_sig(name))
     }
 
     fn substr(&self, name: &[u8], orig: &[u8]) -> Option<i32> {
         let t = &self.text[..];
         let extra = name.len() - t.len();
         let mut best: Option<i32> = None;
-        for p in memchr::memmem::find_iter(name, t) {
-            let s = if boundary(orig, p) { WORD - len_pen(extra, 40) } else { SUBSTR - len_pen(extra, 40) - (p as i32).min(20) };
+        for p in self.finder.find_iter(name) {
+            let s = if boundary(orig, p) {
+                WORD - len_pen(extra, 40)
+            } else {
+                SUBSTR - len_pen(extra, 40) - (p as i32).min(20)
+            };
             best = Some(best.map_or(s, |b: i32| b.max(s)));
             if s >= WORD - 40 {
                 break;
@@ -183,6 +274,21 @@ impl Pattern {
     }
 }
 
+/// Plain scalar subsequence test (faster than memchr on short names).
+#[inline(always)]
+pub fn is_subsequence(t: &[u8], name: &[u8]) -> bool {
+    let mut i = 0;
+    for &b in name {
+        if b == t[i] {
+            i += 1;
+            if i == t.len() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Greedy fuzzy subsequence (fzf-v1 style: forward scan, then a backward
 /// scan from the end to tighten the window), scored by gaps and word starts.
 pub fn fuzzy(t: &[u8], name: &[u8], orig: &[u8]) -> Option<i32> {
@@ -191,19 +297,32 @@ pub fn fuzzy(t: &[u8], name: &[u8], orig: &[u8]) -> Option<i32> {
         return None;
     }
     // Forward: find the end of the earliest complete match.
-    let mut j = 0usize;
-    for &c in t {
-        j += memchr::memchr(c, &name[j..])? + 1;
+    let mut i = 0;
+    let mut end = usize::MAX;
+    for (j, &b) in name.iter().enumerate() {
+        if b == t[i] {
+            i += 1;
+            if i == m {
+                end = j;
+                break;
+            }
+        }
     }
-    let end = j - 1;
+    if end == usize::MAX {
+        return None;
+    }
     // Backward from `end`: latest start that still contains the token.
     let mut pos = [0u16; 64];
     let track = m <= 64;
     let mut k = end + 1;
-    for i in (0..m).rev() {
-        k = memchr::memrchr(t[i], &name[..k])?;
-        if track {
-            pos[i] = k as u16;
+    let mut i = m;
+    while i > 0 {
+        k -= 1;
+        if name[k] == t[i - 1] {
+            i -= 1;
+            if track {
+                pos[i] = k as u16;
+            }
         }
     }
     let start = k;
@@ -283,7 +402,9 @@ mod tests {
         for i in 1..=m {
             for j in 1..=n {
                 let cost = (p[i - 1] != t[j - 1]) as u32;
-                let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+                let mut v = (d[i - 1][j] + 1)
+                    .min(d[i][j - 1] + 1)
+                    .min(d[i - 1][j - 1] + cost);
                 if i > 1 && j > 1 && p[i - 1] == t[j - 2] && p[i - 2] == t[j - 1] {
                     v = v.min(d[i - 2][j - 2] + 1);
                 }
@@ -312,7 +433,9 @@ mod tests {
         }
         fn word(&mut self, max: usize) -> Vec<u8> {
             let len = 1 + (self.next() as usize % max);
-            (0..len).map(|_| b"abcde"[(self.next() % 5) as usize]).collect()
+            (0..len)
+                .map(|_| b"abcde"[(self.next() % 5) as usize])
+                .collect()
         }
     }
 
@@ -324,7 +447,13 @@ mod tests {
             let t = r.word(20);
             let pq = peq(&p);
             for anchored in [false, true] {
-                assert_eq!(osa_distance(&pq, p.len(), &t, anchored), osa_ref(&p, &t, anchored), "p={:?} t={:?} anchored={anchored}", String::from_utf8_lossy(&p), String::from_utf8_lossy(&t));
+                assert_eq!(
+                    osa_distance(&pq, p.len(), &t, anchored),
+                    osa_ref(&p, &t, anchored),
+                    "p={:?} t={:?} anchored={anchored}",
+                    String::from_utf8_lossy(&p),
+                    String::from_utf8_lossy(&t)
+                );
             }
         }
     }
@@ -339,7 +468,8 @@ mod tests {
     }
 
     fn s(tok: &str, name: &str) -> Option<i32> {
-        Pattern::new(&fold_all(tok.as_bytes()), true).score(&fold_all(name.as_bytes()), name.as_bytes())
+        Pattern::new(&fold_all(tok.as_bytes()), true)
+            .score(&fold_all(name.as_bytes()), name.as_bytes())
     }
 
     #[test]
@@ -351,7 +481,10 @@ mod tests {
         let sub = s("port", "airportcodes").unwrap();
         let fz = s("rpt", "report").unwrap();
         assert_eq!(exact, EXACT);
-        assert!(exact > stem && stem > prefix && prefix > word, "{exact} {stem} {prefix} {word}");
+        assert!(
+            exact > stem && stem > prefix && prefix > word,
+            "{exact} {stem} {prefix} {word}"
+        );
         assert!(word > SUBSTR - 100 && sub < WORD && sub > fz, "{sub} {fz}");
         assert!(fz <= FUZZY_MAX);
     }
@@ -364,13 +497,21 @@ mod tests {
     #[test]
     fn typos_anywhere() {
         // swap, drop, insert, substitute – including the first character.
-        for q in ["flashfnid", "flashfid", "flashfiind", "flashfund", "lfashfind", "glashfind"] {
+        for q in [
+            "flashfnid",
+            "flashfid",
+            "flashfiind",
+            "flashfund",
+            "lfashfind",
+            "glashfind",
+        ] {
             let sc = s(q, "flashfind.rs");
             assert!(sc.is_some(), "{q}");
         }
         // Short tokens get no typos.
         assert_eq!(s("abc", "xyz"), None);
-        assert!(s("tset", "test.py").is_some());
+        assert!(s("tsest", "tests.py").is_some());
+        assert_eq!(s("tset", "test.py"), None, "4-byte tokens take no typos");
         // Two edits only for 8+ bytes.
         assert!(s("invocie_drfat", "invoice_draft.pdf").is_some());
         assert_eq!(s("tsxt", "tabcdef"), None);
@@ -390,6 +531,32 @@ mod tests {
         let tighter = s("notes", "my_notes.md").unwrap();
         assert!(tight.is_some());
         assert!(tighter > tight.unwrap());
+    }
+
+    #[test]
+    fn bigram_filter_is_conservative() {
+        // Every pair within budget must pass the bigram filter.
+        let mut r = Rng(99);
+        let mut checked = 0;
+        for _ in 0..20000 {
+            let p = r.word(14);
+            let t = r.word(24);
+            let pat = Pattern::new(&p, true);
+            if pat.typos == 0 {
+                continue;
+            }
+            let d = osa_ref(&p, &t, false);
+            if d <= pat.typos as u32 {
+                checked += 1;
+                assert!(
+                    pat.typo_candidate(bigram_sig(&t)),
+                    "p={:?} t={:?}",
+                    String::from_utf8_lossy(&p),
+                    String::from_utf8_lossy(&t)
+                );
+            }
+        }
+        assert!(checked > 100, "{checked}");
     }
 
     #[test]

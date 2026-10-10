@@ -14,7 +14,7 @@
 //! * **Cancellation** – every phase polls a [`CancelToken`] between chunks.
 
 use crate::index::Index;
-use crate::matcher::{MAX_NON_PREFIX, may_match};
+use crate::matcher::{MAX_NON_PREFIX, TYPO1, may_match};
 use crate::query::{Mode, Query, Token};
 use crate::walk::{KIND_MASK, NONE};
 use rayon::prelude::*;
@@ -89,11 +89,25 @@ pub struct SearchResult {
     pub strategy: Strategy,
     /// Distinct names whose score was computed.
     pub names_scored: usize,
+    /// Names that survived the name phase.
+    pub names_matched: usize,
+    /// Time in the name phase and the entry phase (µs).
+    pub name_us: u32,
+    pub entry_us: u32,
 }
 
 impl SearchResult {
     fn empty(strategy: Strategy) -> Self {
-        SearchResult { hits: Vec::new(), total: 0, total_exact: true, strategy, names_scored: 0 }
+        SearchResult {
+            hits: Vec::new(),
+            total: 0,
+            total_exact: true,
+            strategy,
+            names_scored: 0,
+            names_matched: 0,
+            name_us: 0,
+            entry_us: 0,
+        }
     }
 }
 
@@ -113,7 +127,16 @@ struct NameKey {
 
 impl NameKey {
     fn of(q: &Query) -> Self {
-        NameKey { toks: q.tokens.iter().take(MAX_TOKENS).map(|t| (t.mode, t.pat.text.clone(), t.pat.typos)).collect(), negs: q.negs.clone(), exts: q.exts.clone() }
+        NameKey {
+            toks: q
+                .tokens
+                .iter()
+                .take(MAX_TOKENS)
+                .map(|t| (t.mode, t.pat.text.clone(), t.pat.typos))
+                .collect(),
+            negs: q.negs.clone(),
+            exts: q.exts.clone(),
+        }
     }
 
     /// Does every name matching `self` also match `prev`?
@@ -135,7 +158,9 @@ impl NameKey {
                 return false;
             }
         }
-        prev.negs.iter().all(|n| self.negs.contains(n)) && (prev.exts.is_empty() || (!self.exts.is_empty() && self.exts.iter().all(|e| prev.exts.contains(e))))
+        prev.negs.iter().all(|n| self.negs.contains(n))
+            && (prev.exts.is_empty()
+                || (!self.exts.is_empty() && self.exts.iter().all(|e| prev.exts.contains(e))))
     }
 }
 
@@ -159,7 +184,12 @@ fn better(a: &Hit, b: &Hit) -> std::cmp::Ordering {
 
 impl TopK {
     fn new(k: usize) -> Self {
-        TopK { k, buf: Vec::with_capacity((2 * k).min(1 << 16)), floor: i32::MIN, total: 0 }
+        TopK {
+            k,
+            buf: Vec::with_capacity((2 * k).min(1 << 16)),
+            floor: i32::MIN,
+            total: 0,
+        }
     }
     #[inline]
     fn push(&mut self, h: Hit) {
@@ -196,40 +226,61 @@ struct Ctx<'a> {
     idx: &'a Index,
     q: &'a Query,
     toks: &'a [Token],
+    negs: Vec<memchr::memmem::Finder<'a>>,
     cancel: &'a CancelToken,
+    /// False during the clean-only first pass.
+    typos: bool,
 }
 
 impl Ctx<'_> {
+    #[inline(always)]
+    fn k(&self, t: &Token) -> u8 {
+        if self.typos { t.pat.typos } else { 0 }
+    }
+
     /// Name-level predicates and scores for one name id.
     #[inline]
     fn score_name(&self, id: u32, mask: u64) -> Option<Row> {
         let toks = self.toks;
         if toks.len() == 1 {
             let t = &toks[0];
-            if !may_match(t.pat.mask, t.pat.typos, mask) {
+            if !may_match(t.pat.mask, self.k(t), mask) {
                 return None;
             }
-        } else if !toks.is_empty() && !toks.iter().any(|t| may_match(t.pat.mask, t.pat.typos, mask)) {
+        } else if !toks.is_empty() && !toks.iter().any(|t| may_match(t.pat.mask, self.k(t), mask)) {
             return None;
         }
+        self.score_name_unmasked(id)
+    }
+
+    /// `score_name` minus the single-token mask test (already applied).
+    #[inline]
+    fn score_name_unmasked(&self, id: u32) -> Option<Row> {
+        let toks = self.toks;
+        let mask = self.idx.name_mask()[id as usize];
         let lower = self.idx.lower(id);
         if !self.q.exts.is_empty() && !has_ext(lower, &self.q.exts) {
             return None;
         }
-        if self.q.negs.iter().any(|n| memchr::memmem::find(lower, n).is_some()) {
+        if self.negs.iter().any(|n| n.find(lower).is_some()) {
             return None;
         }
         if toks.is_empty() {
-            return Some(Row { id, score: 0, bits: 0 });
+            return Some(Row {
+                id,
+                score: 0,
+                bits: 0,
+            });
         }
         let orig = self.idx.orig(id);
+        let sig = self.idx.sig(id);
         let mut score = 0;
         let mut bits = 0u8;
         for (i, t) in toks.iter().enumerate() {
-            if toks.len() > 1 && !may_match(t.pat.mask, t.pat.typos, mask) {
+            if toks.len() > 1 && !may_match(t.pat.mask, self.k(t), mask) {
                 continue;
             }
-            if let Some(s) = t.score(lower, orig) {
+            if let Some(s) = t.score_opt(lower, orig, sig, self.typos) {
                 score += s;
                 bits |= 1 << i;
             }
@@ -241,22 +292,50 @@ impl Ctx<'_> {
         let masks = self.idx.name_mask();
         let u = self.idx.u;
         let chunks = u.div_ceil(NAME_CHUNK);
+        // Loosest mask requirement over all tokens: (need, typos).
+        let pre: Vec<(u64, u8)> = self.toks.iter().map(|t| (t.pat.mask, self.k(t))).collect();
         let parts: Vec<Vec<Row>> = (0..chunks)
             .into_par_iter()
-            .map(|c| {
-                if self.cancel.is_cancelled() {
-                    return Vec::new();
-                }
-                let lo = c * NAME_CHUNK;
-                let hi = (lo + NAME_CHUNK).min(u);
-                let mut out = Vec::new();
-                for id in lo..hi {
-                    if let Some(r) = self.score_name(id as u32, masks[id]) {
-                        out.push(r);
+            .map_init(
+                || vec![0u32; NAME_CHUNK],
+                |cand, c| {
+                    if self.cancel.is_cancelled() {
+                        return Vec::new();
                     }
-                }
-                out
-            })
+                    let lo = c * NAME_CHUNK;
+                    let hi = (lo + NAME_CHUNK).min(u);
+                    // Branchless gather of mask survivors (the mask test is
+                    // ~50% unpredictable; branching on it costs more than it).
+                    let mut n = 0usize;
+                    match pre.as_slice() {
+                        [] => {
+                            for id in lo..hi {
+                                cand[n] = id as u32;
+                                n += 1;
+                            }
+                        }
+                        [(need, k)] => {
+                            for (i, &m) in masks[lo..hi].iter().enumerate() {
+                                cand[n] = (lo + i) as u32;
+                                n += may_match(*need, *k, m) as usize;
+                            }
+                        }
+                        many => {
+                            for (i, &m) in masks[lo..hi].iter().enumerate() {
+                                cand[n] = (lo + i) as u32;
+                                n += many.iter().any(|&(need, k)| may_match(need, k, m)) as usize;
+                            }
+                        }
+                    }
+                    let mut out = Vec::new();
+                    for &id in &cand[..n] {
+                        if let Some(r) = self.score_name_unmasked(id) {
+                            out.push(r);
+                        }
+                    }
+                    out
+                },
+            )
             .collect();
         self.check()?;
         Ok(parts.concat())
@@ -270,7 +349,9 @@ impl Ctx<'_> {
                 if self.cancel.is_cancelled() {
                     return Vec::new();
                 }
-                ch.iter().filter_map(|r| self.score_name(r.id, masks[r.id as usize])).collect()
+                ch.iter()
+                    .filter_map(|r| self.score_name(r.id, masks[r.id as usize]))
+                    .collect()
             })
             .collect();
         self.check()?;
@@ -279,21 +360,44 @@ impl Ctx<'_> {
 
     #[inline]
     fn check(&self) -> Result<(), Cancelled> {
-        if self.cancel.is_cancelled() { Err(Cancelled) } else { Ok(()) }
+        if self.cancel.is_cancelled() {
+            Err(Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     #[inline]
     fn entry_ok(&self, e: usize, kinds: &[u8], sizes: &[u64], mtimes: &[i64]) -> bool {
         let q = self.q;
-        (1u8 << (kinds[e] & KIND_MASK)) & q.kinds != 0 && sizes[e] >= q.size.0 && sizes[e] <= q.size.1 && mtimes[e] >= q.mtime.0 && mtimes[e] <= q.mtime.1
+        (1u8 << (kinds[e] & KIND_MASK)) & q.kinds != 0
+            && sizes[e] >= q.size.0
+            && sizes[e] <= q.size.1
+            && mtimes[e] >= q.mtime.0
+            && mtimes[e] <= q.mtime.1
     }
 
     /// Expand name rows to entries and keep the top `limit`.
-    fn entries(&self, rows: &[Row], range: (u32, u32), anc: Option<&[u8]>) -> Result<(Vec<Hit>, u64), Cancelled> {
+    fn entries(
+        &self,
+        rows: &[Row],
+        range: (u32, u32),
+        anc: Option<&[u8]>,
+    ) -> Result<(Vec<Hit>, u64), Cancelled> {
         let idx = self.idx;
-        let (kinds, sizes, mtimes, prior, parent) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime(), idx.ent_prior(), idx.ent_parent());
+        let (kinds, sizes, mtimes, prior, parent) = (
+            idx.ent_kind(),
+            idx.ent_size(),
+            idx.ent_mtime(),
+            idx.ent_prior(),
+            idx.ent_parent(),
+        );
         let ntok = self.toks.len().min(MAX_TOKENS);
-        let all: u8 = if ntok == 0 { 0 } else { ((1u16 << ntok) - 1) as u8 };
+        let all: u8 = if ntok == 0 {
+            0
+        } else {
+            ((1u16 << ntok) - 1) as u8
+        };
         let full_range = range == (0, idx.n as u32);
         let limit = self.q.limit.max(1);
         // Chunk rows so each work item expands roughly ENTRY_CHUNK entries.
@@ -341,7 +445,10 @@ impl Ctx<'_> {
                         } else if r.bits != all {
                             continue;
                         }
-                        tk.push(Hit { entry: e, score: score + prior[eu] as i32 });
+                        tk.push(Hit {
+                            entry: e,
+                            score: score + prior[eu] as i32,
+                        });
                     }
                 }
                 tk
@@ -349,6 +456,78 @@ impl Ctx<'_> {
             .reduce(|| TopK::new(limit), TopK::merge);
         self.check()?;
         Ok(top.finish())
+    }
+
+    fn no_entry_filters(&self) -> bool {
+        let q = self.q;
+        q.kinds == crate::query::KINDS_ALL
+            && q.size == (0, u64::MAX)
+            && q.mtime == (i64::MIN, i64::MAX)
+    }
+
+    fn count_in_range(&self, id: u32, range: (u32, u32)) -> u64 {
+        let ents = self.idx.entries_of(id);
+        if range == (0, self.idx.n as u32) {
+            return ents.len() as u64;
+        }
+        (ents.partition_point(|&e| e < range.1) - ents.partition_point(|&e| e < range.0)) as u64
+    }
+
+    /// Single-token rows sorted by score (desc): expand sequentially and stop
+    /// as soon as the best remaining name cannot reach the current k-th hit.
+    /// Returns (hits, entries seen, stopped early).
+    fn entries_ranked(
+        &self,
+        rows: &[Row],
+        range: (u32, u32),
+        limit: usize,
+    ) -> Result<(Vec<Hit>, u64, bool), Cancelled> {
+        let idx = self.idx;
+        let (kinds, sizes, mtimes, prior) = (
+            idx.ent_kind(),
+            idx.ent_size(),
+            idx.ent_mtime(),
+            idx.ent_prior(),
+        );
+        let full_range = range == (0, idx.n as u32);
+        let mut tk = TopK::new(limit);
+        // Wave 1 (sequential): best rows until the page is full.
+        let mut i = 0;
+        while i < rows.len() && tk.buf.len() < limit {
+            let r = &rows[i];
+            let mut ents = idx.entries_of(r.id);
+            if !full_range {
+                let a = ents.partition_point(|&e| e < range.0);
+                let b = ents.partition_point(|&e| e < range.1);
+                ents = &ents[a..b];
+            }
+            for &e in ents {
+                let eu = e as usize;
+                if self.entry_ok(eu, kinds, sizes, mtimes) {
+                    tk.push(Hit {
+                        entry: e,
+                        score: r.score + prior[eu] as i32,
+                    });
+                }
+            }
+            i += 1;
+        }
+        if i == rows.len() {
+            let (h, t) = tk.finish();
+            return Ok((h, t, false));
+        }
+        tk.trim();
+        let kth = tk.buf.iter().map(|h| h.score).min().unwrap_or(i32::MIN);
+        // Rows that could still reach the page: a contiguous run (sorted desc).
+        let j = i + rows[i..].partition_point(|r| r.score + MAX_PRIOR >= kth);
+        // Wave 2 (parallel) over that run.
+        let (more, seen) = self.entries(&rows[i..j], range, None)?;
+        let total = tk.total + seen;
+        let mut buf = tk.buf;
+        buf.extend(more);
+        buf.sort_unstable_by(better);
+        buf.truncate(limit);
+        Ok((buf, total, j < rows.len()))
     }
 
     /// Ancestor token bits per directory id (multi-token queries).
@@ -373,7 +552,12 @@ impl Ctx<'_> {
 
     fn entry_scan(&self, range: (u32, u32)) -> Result<(Vec<Hit>, u64), Cancelled> {
         let idx = self.idx;
-        let (kinds, sizes, mtimes, prior) = (idx.ent_kind(), idx.ent_size(), idx.ent_mtime(), idx.ent_prior());
+        let (kinds, sizes, mtimes, prior) = (
+            idx.ent_kind(),
+            idx.ent_size(),
+            idx.ent_mtime(),
+            idx.ent_prior(),
+        );
         let limit = self.q.limit.max(1);
         let lo = range.0.max(1) as usize;
         let hi = range.1 as usize;
@@ -384,7 +568,10 @@ impl Ctx<'_> {
                 || TopK::new(limit),
                 |mut tk, e| {
                     if self.entry_ok(e, kinds, sizes, mtimes) {
-                        tk.push(Hit { entry: e as u32, score: prior[e] as i32 });
+                        tk.push(Hit {
+                            entry: e as u32,
+                            score: prior[e] as i32,
+                        });
                     }
                     tk
                 },
@@ -396,7 +583,9 @@ impl Ctx<'_> {
 }
 
 fn has_ext(lower: &[u8], exts: &[Vec<u8>]) -> bool {
-    exts.iter().any(|e| lower.len() > e.len() && lower.ends_with(e) && lower[lower.len() - e.len() - 1] == b'.')
+    exts.iter().any(|e| {
+        lower.len() > e.len() && lower.ends_with(e) && lower[lower.len() - e.len() - 1] == b'.'
+    })
 }
 
 /// Contiguous range of `name_sorted` whose names start with `t`.
@@ -407,7 +596,13 @@ pub fn prefix_range(idx: &Index, t: &[u8]) -> std::ops::Range<usize> {
     lo..lo + len
 }
 
-fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &CancelToken, shortcuts: bool) -> Result<SearchResult, Cancelled> {
+fn run(
+    idx: &Index,
+    q: &Query,
+    mut cache: Option<&mut Vec<Survivors>>,
+    cancel: &CancelToken,
+    shortcuts: bool,
+) -> Result<SearchResult, Cancelled> {
     if cancel.is_cancelled() {
         return Err(Cancelled);
     }
@@ -419,32 +614,143 @@ fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &
         },
     };
     let toks = &q.tokens[..q.tokens.len().min(MAX_TOKENS)];
-    let ctx = Ctx { idx, q, toks, cancel };
+    let negs = q
+        .negs
+        .iter()
+        .map(|n| memchr::memmem::Finder::new(n))
+        .collect();
+    let mut ctx = Ctx {
+        idx,
+        q,
+        toks,
+        negs,
+        cancel,
+        typos: true,
+    };
     if q.is_empty_name_query() {
+        let t = std::time::Instant::now();
         let (hits, total) = ctx.entry_scan(range)?;
-        return Ok(SearchResult { hits, total, total_exact: true, strategy: Strategy::EntryScan, names_scored: 0 });
+        return Ok(SearchResult {
+            hits,
+            total,
+            total_exact: true,
+            strategy: Strategy::EntryScan,
+            names_scored: 0,
+            names_matched: 0,
+            name_us: 0,
+            entry_us: t.elapsed().as_micros() as u32,
+        });
     }
-    // --- Prefix-range shortcut.
-    if shortcuts && toks.len() == 1 {
+    // --- Prefix-range shortcut: names starting with the token are a
+    // contiguous slice of `name_sorted`; score them, expand in score order and
+    // stop once no remaining name can enter the page. If the page's k-th hit
+    // beats every possible non-prefix match, it is the exact answer.
+    if shortcuts
+        && toks.len() == 1
+        && toks[0].mode != Mode::Suffix
+        && toks[0].mode != Mode::Substring
+    {
         let t = &toks[0];
         let complete = matches!(t.mode, Mode::Prefix | Mode::Exact);
-        if complete || (t.mode == Mode::Fuzzy && t.pat.text.len() <= 2) {
-            let r = prefix_range(idx, &t.pat.text);
-            let sorted = idx.name_sorted();
-            let masks = idx.name_mask();
-            let ids = &sorted[r];
-            let mut rows: Vec<Row> = ids.par_iter().filter_map(|&id| ctx.score_name(id, masks[id as usize])).collect();
-            rows.sort_unstable_by_key(|r| r.id);
-            let (hits, total) = ctx.entries(&rows, range, None)?;
-            let limit = q.limit.max(1);
-            let proven = hits.len() >= limit && hits[limit - 1].score > MAX_NON_PREFIX + MAX_PRIOR;
-            if complete || proven {
-                return Ok(SearchResult { hits, total, total_exact: complete, strategy: Strategy::PrefixRange, names_scored: ids.len() });
+        let t0 = std::time::Instant::now();
+        let r = prefix_range(idx, &t.pat.text);
+        let ids = &idx.name_sorted()[r];
+        let masks = idx.name_mask();
+        let mut rows: Vec<Row> = if ids.len() > 32 * 1024 {
+            ids.par_iter()
+                .filter_map(|&id| ctx.score_name(id, masks[id as usize]))
+                .collect()
+        } else {
+            ids.iter()
+                .filter_map(|&id| ctx.score_name(id, masks[id as usize]))
+                .collect()
+        };
+        if rows.len() > 32 * 1024 {
+            rows.par_sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.id.cmp(&b.id)));
+        } else {
+            rows.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.id.cmp(&b.id)));
+        }
+        let name_us = t0.elapsed().as_micros() as u32;
+        let t1 = std::time::Instant::now();
+        let limit = q.limit.max(1);
+        let (hits, total, stopped) = ctx.entries_ranked(&rows, range, limit)?;
+        let proven = hits.len() >= limit && hits[limit - 1].score > MAX_NON_PREFIX + MAX_PRIOR;
+        if complete || proven {
+            let mut total = total;
+            // `^prefix` / `=exact`: the range is the whole answer, so count it.
+            if complete && stopped {
+                total = if ctx.no_entry_filters() {
+                    rows.iter().map(|r| ctx.count_in_range(r.id, range)).sum()
+                } else {
+                    ctx.entries(&rows, range, None)?.1
+                };
             }
+            return Ok(SearchResult {
+                hits,
+                total,
+                total_exact: complete,
+                strategy: Strategy::PrefixRange,
+                names_scored: ids.len(),
+                names_matched: rows.len(),
+                name_us,
+                entry_us: t1.elapsed().as_micros() as u32,
+            });
         }
     }
+    // --- Clean-first gate: a single 5–8 byte fuzzy token forgives one typo,
+    // but typo matches score at most TYPO1 + 30 (+ prior). If the clean pass
+    // alone already fills the page above that, typo matching cannot change
+    // the page, so it is skipped (total becomes a lower bound).
+    if shortcuts && toks.len() == 1 && toks[0].mode == Mode::Fuzzy && toks[0].pat.typos == 1 {
+        let t0 = std::time::Instant::now();
+        ctx.typos = false;
+        let mut key = NameKey::of(q);
+        key.toks[0].2 = 0;
+        let (rows, strategy, scored) = name_phase(&ctx, key, cache.as_deref_mut())?;
+        let name_us = t0.elapsed().as_micros() as u32;
+        let t1 = std::time::Instant::now();
+        let (hits, total) = ctx.entries(&rows, range, None)?;
+        let limit = q.limit.max(1);
+        if hits.len() >= limit && hits[limit - 1].score > TYPO1 + 30 + MAX_PRIOR {
+            return Ok(SearchResult {
+                hits,
+                total,
+                total_exact: false,
+                strategy,
+                names_scored: scored,
+                names_matched: rows.len(),
+                name_us,
+                entry_us: t1.elapsed().as_micros() as u32,
+            });
+        }
+        ctx.typos = true;
+    }
     // --- Name phase: cached, narrowed or full.
+    let t0 = std::time::Instant::now();
     let key = NameKey::of(q);
+    let (rows, strategy, scored) = name_phase(&ctx, key, cache)?;
+    let name_us = t0.elapsed().as_micros() as u32;
+    let t1 = std::time::Instant::now();
+    let anc = (toks.len() > 1).then(|| ctx.ancestors(&rows));
+    let (hits, total) = ctx.entries(&rows, range, anc.as_deref())?;
+    Ok(SearchResult {
+        hits,
+        total,
+        total_exact: true,
+        strategy,
+        names_scored: scored,
+        names_matched: rows.len(),
+        name_us,
+        entry_us: t1.elapsed().as_micros() as u32,
+    })
+}
+
+fn name_phase(
+    ctx: &Ctx,
+    key: NameKey,
+    cache: Option<&mut Vec<Survivors>>,
+) -> Result<(Arc<Vec<Row>>, Strategy, usize), Cancelled> {
+    let idx = ctx.idx;
     let mut strategy = Strategy::Full;
     let mut rows: Option<Arc<Vec<Row>>> = None;
     let mut scored = idx.u;
@@ -463,18 +769,19 @@ fn run(idx: &Index, q: &Query, mut cache: Option<&mut Vec<Survivors>>, cancel: &
         Some(r) => r,
         None => Arc::new(ctx.full_names()?),
     };
-    if let Some(c) = cache.as_deref_mut()
+    if let Some(c) = cache
         && strategy != Strategy::Cached
     {
         c.retain(|s| s.key != key);
-        c.push(Survivors { key, rows: rows.clone() });
+        c.push(Survivors {
+            key,
+            rows: rows.clone(),
+        });
         if c.len() > CACHE {
             c.remove(0);
         }
     }
-    let anc = (toks.len() > 1).then(|| ctx.ancestors(&rows));
-    let (hits, total) = ctx.entries(&rows, range, anc.as_deref())?;
-    Ok(SearchResult { hits, total, total_exact: true, strategy, names_scored: scored })
+    Ok((rows, strategy, scored))
 }
 
 /// One-shot search (no narrowing cache).
@@ -484,7 +791,11 @@ pub fn search(idx: &Index, q: &Query, cancel: &CancelToken) -> Result<SearchResu
 
 /// Full scan with every shortcut disabled (reference for tests/benches).
 #[doc(hidden)]
-pub fn search_reference(idx: &Index, q: &Query, cancel: &CancelToken) -> Result<SearchResult, Cancelled> {
+pub fn search_reference(
+    idx: &Index,
+    q: &Query,
+    cancel: &CancelToken,
+) -> Result<SearchResult, Cancelled> {
     run(idx, q, None, cancel, false)
 }
 
@@ -497,7 +808,10 @@ pub struct Session {
 
 impl Session {
     pub fn new(idx: Arc<Index>) -> Session {
-        Session { idx, cache: Vec::new() }
+        Session {
+            idx,
+            cache: Vec::new(),
+        }
     }
     pub fn index(&self) -> &Arc<Index> {
         &self.idx

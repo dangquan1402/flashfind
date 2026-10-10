@@ -46,17 +46,32 @@ fn raise_fd_limit() {
 pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<Listing> {
     let threads = opts.threads.max(1);
     raise_fd_limit();
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| no_materialize()).build().expect("thread pool");
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .start_handler(|_| no_materialize())
+        .build()
+        .expect("thread pool");
     let sink = Sink::new(threads);
     let root_b = root.as_os_str().as_bytes().to_vec();
-    let fd = CString::new(root_b.clone()).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) });
+    let fd =
+        CString::new(root_b.clone()).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) });
     let track = (!opts.skip.is_empty()).then_some(root_b);
     pool.scope(|s| finish_dir(s, fd, track, 0, opts, &sink));
     sink.finish()
 }
 
-fn finish_dir<'s>(s: &rayon::Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, opts: &'s ScanOptions, sink: &'s Sink) {
-    let mut l = Listing { id, ..Default::default() };
+fn finish_dir<'s>(
+    s: &rayon::Scope<'s>,
+    fd: i32,
+    path: Option<Vec<u8>>,
+    id: u32,
+    opts: &'s ScanOptions,
+    sink: &'s Sink,
+) {
+    let mut l = Listing {
+        id,
+        ..Default::default()
+    };
     if fd < 0 {
         sink.push(l);
         return;
@@ -99,12 +114,25 @@ fn rd64(b: &[u8], at: usize) -> u64 {
 fn list_fd(fd: i32, l: &mut Listing) {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
-    al.commonattr = libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_MODTIME | libc::ATTR_CMN_FLAGS;
+    al.commonattr = libc::ATTR_CMN_RETURNED_ATTRS
+        | libc::ATTR_CMN_NAME
+        | ATTR_CMN_ERROR
+        | libc::ATTR_CMN_OBJTYPE
+        | libc::ATTR_CMN_MODTIME
+        | libc::ATTR_CMN_FLAGS;
     al.dirattr = libc::ATTR_DIR_MOUNTSTATUS;
     al.fileattr = libc::ATTR_FILE_DATALENGTH;
     BUF.with_borrow_mut(|buf| {
         loop {
-            let n = unsafe { libc::getattrlistbulk(fd, &mut al as *mut _ as *mut libc::c_void, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            let n = unsafe {
+                libc::getattrlistbulk(
+                    fd,
+                    &mut al as *mut _ as *mut libc::c_void,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                )
+            };
             if n <= 0 {
                 break;
             }

@@ -46,21 +46,30 @@ fn open(a: &mut Args, cfg: &Config) -> Arc<CodeLive> {
     let fresh = live.snapshot().base.age() < Duration::from_secs(5);
     if refresh && !fresh {
         live.compact();
-    } else if flashfind_core::watch::native_events() && !fresh {
-        let n = live.replay(Duration::from_secs(3));
-        // A day of drift: fold it into a fresh base once.
-        if live.snapshot().base.age() > Duration::from_secs(86_400) {
+    } else if !fresh {
+        // Catch up by re-statting indexed folders (no event-history replay:
+        // a busy home folder has ~10k FSEvents a minute).
+        let t = Instant::now();
+        live.recheck();
+        // A day of drift (or, without FSEvents, --max-age): fold it into a fresh base once.
+        let limit = if flashfind_core::watch::native_events() {
+            Duration::from_secs(86_400)
+        } else {
+            max_age
+        };
+        if live.snapshot().base.age() > limit {
             live.compact();
         }
         if verbose {
             let st = live.stats();
             eprintln!(
-                "replayed {n} events: {} repos re-walked, {} added, {} removed",
-                st.rewalks, st.repos_added, st.repos_removed
+                "recheck {:.0} ms: {} repos re-walked, {} added, {} removed",
+                t.elapsed().as_secs_f64() * 1e3,
+                st.rewalks,
+                st.repos_added,
+                st.repos_removed
             );
         }
-    } else if !fresh && live.snapshot().base.age() > max_age {
-        live.compact();
     }
     let info = live.snapshot().base.info.clone();
     if fresh || refresh || verbose {
@@ -639,14 +648,14 @@ pub fn cmd_bench_live_code(mut a: Args) {
     let cache = a.opt(&["--cache"]).map(PathBuf::from).unwrap_or_else(CodeIndex::default_dir);
     let t0 = Instant::now();
     let live = CodeLive::open(cfg, Some(cache));
-    let replayed = live.replay(Duration::from_secs(3));
-    let ready = t0.elapsed();
     live.watch().unwrap_or_else(|e| die(e));
+    let replayed = live.recheck();
+    let ready = t0.elapsed();
     std::thread::sleep(Duration::from_millis(300));
     let mut s = CodeSession::new(live.clone());
     let st = live.stats();
     eprintln!(
-        "{} repos, {} entries; open + replay ({replayed} events) {:.0} ms",
+        "{} repos, {} entries; open + watch + recheck ({replayed} repos re-walked) {:.0} ms",
         st.repos,
         st.entries,
         ready.as_secs_f64() * 1e3

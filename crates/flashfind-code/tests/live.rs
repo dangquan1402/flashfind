@@ -218,3 +218,30 @@ fn fsevents_end_to_end() {
     live.unwatch();
     let _ = std::fs::remove_dir_all(home);
 }
+
+#[test]
+fn recheck_catches_up_without_events() {
+    let (home, live) = world("recheck");
+    let cfg = live.config().clone();
+    drop(live);
+    // Changes while nothing is running, older than the crawl's second.
+    std::thread::sleep(Duration::from_millis(2100));
+    put(&home, "dev/alpha/src/while_away.rs", "x");
+    std::fs::remove_dir_all(home.join("dev/beta")).unwrap();
+    fake_repo(&home, "dev/zeta", &["zeta_new.c"]);
+    let live = CodeLive::open(cfg, Some(home.join(".cache")));
+    let mut s = CodeSession::new(live.clone());
+    assert!(find(&mut s, "while_away").is_empty(), "stale before recheck");
+    live.recheck();
+    assert_eq!(find(&mut s, "while_away"), vec!["alpha:src/while_away.rs"]);
+    assert!(find(&mut s, "beta_core").is_empty());
+    assert_eq!(find(&mut s, "zeta_new"), vec!["zeta:zeta_new.c"]);
+    let st = live.stats();
+    assert_eq!((st.repos, st.repos_added, st.repos_removed), (2, 1, 1));
+    // Nothing changed since: a second recheck only revisits same-second folders.
+    let before = live.stats().rewalks;
+    std::thread::sleep(Duration::from_millis(2100));
+    live.recheck();
+    assert!(live.stats().rewalks - before <= 2, "{}", live.stats().rewalks - before);
+    let _ = std::fs::remove_dir_all(home);
+}

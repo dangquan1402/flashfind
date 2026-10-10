@@ -513,6 +513,44 @@ impl CodeLive {
         }
     }
 
+    /// Fast catch-up without event history: stat every indexed folder in
+    /// parallel and treat the ones whose mtime changed (or that vanished) as
+    /// change events. Catches added / removed / renamed entries and new or
+    /// deleted repos under indexed folders; it does not see in-place file
+    /// edits (a watcher does). ~50 ms for ~270k entries on an M-series Mac,
+    /// versus seconds to replay a busy home folder's FSEvents history.
+    /// Returns the number of repos re-walked, added or removed.
+    pub fn recheck(&self) -> usize {
+        use rayon::prelude::*;
+        let snap = self.snapshot();
+        let mut indexes: Vec<(&CodeIndex, Option<&[u64]>)> = vec![(&snap.base, snap.dead_mask.as_deref())];
+        indexes.extend(snap.overlays.iter().map(|o| (&**o, None)));
+        let mut events: Vec<(PathBuf, u32)> = Vec::new();
+        for (ci, dead) in indexes {
+            let idx = &ci.idx;
+            let built = ci.info.built_at;
+            let changed: Vec<(PathBuf, u32)> = (0..idx.n as u32)
+                .into_par_iter()
+                .filter(|&e| idx.dir_id(e).is_some() && dead.is_none_or(|m| m[e as usize >> 6] & (1 << (e & 63)) == 0))
+                .filter_map(|e| {
+                    let mut b = Vec::new();
+                    idx.path(e, &mut b);
+                    let p = bytes_path(&b);
+                    let then = idx.mtime(e);
+                    let now = std::fs::symlink_metadata(&p).ok().map(|m| flashfind_core::walk::mtime_of(&m));
+                    // Same-second edits around the crawl are ambiguous: recheck those too.
+                    let stale = match now {
+                        Some(m) => m != then || m >= built - 2,
+                        None => true,
+                    };
+                    stale.then_some((p, 0))
+                })
+                .collect();
+            events.extend(changed);
+        }
+        self.apply(&events)
+    }
+
     /// Fold overlays into a fresh saved base (call before quitting).
     pub fn checkpoint(&self) {
         let s = self.snapshot();

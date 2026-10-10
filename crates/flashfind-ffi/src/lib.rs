@@ -498,7 +498,7 @@ pub struct FfCodeStats {
 
 /// Open the code-projects index. `roots`: ':'-separated folders, or NULL for
 /// $FLASHFIND_CODE_ROOTS / ~. `cache_dir`: NULL for ~/.cache/flashfind.
-/// Loads the cache (replaying FSEvents since it was built on macOS) or
+/// Loads the cache (re-statting indexed folders to catch up) or
 /// discovers + crawls (seconds for a big home): call off the main thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ff_code_open(roots: *const c_char, cache_dir: *const c_char, err: *mut *mut c_char) -> *mut FfCode {
@@ -517,8 +517,8 @@ pub unsafe extern "C" fn ff_code_open(roots: *const c_char, cache_dir: *const c_
         .map(std::path::PathBuf::from)
         .unwrap_or_else(flashfind_code::CodeIndex::default_dir);
     let live = CodeLive::open(cfg, Some(cache));
-    if flashfind_core::watch::native_events() && live.snapshot().base.age() > std::time::Duration::from_secs(5) {
-        live.replay(std::time::Duration::from_secs(3));
+    if live.snapshot().base.age() > std::time::Duration::from_secs(5) {
+        live.recheck();
     }
     Box::into_raw(Box::new(FfCode(live)))
 }

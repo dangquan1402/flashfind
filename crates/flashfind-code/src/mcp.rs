@@ -94,6 +94,7 @@ impl Server {
         if let Err(e) = live.watch() {
             eprintln!("flashfind mcp: not watching for changes: {e}");
         }
+        live.recheck();
         Server::with_live(live)
     }
 

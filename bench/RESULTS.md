@@ -10,10 +10,10 @@ CPU: Apple M5 Pro, 15 cores (5 performance)
 RAM: 48 GB
 Disk: APFS
 rustc 1.92.0 (ded5c06cf 2025-12-08)
-flashfind 5a91fac, fsearch 76d612f (upstream main)
+flashfind 692eca1, fsearch 76d612f (upstream main)
 tree: 1000000 files + 100000 dirs, seed 42; queries: 806 lines; 5 passes
-load average before: 170.72 86.04 55.88; after: 59.77 73.22 55.54
-flashfind portable read_dir crawl (for comparison): 20379 ms
+load average before: 107.66 121.27 87.41; after: 46.77 97.72 82.65
+flashfind portable read_dir crawl (for comparison): 17475 ms
 ```
 
 ## Index build
@@ -21,13 +21,13 @@ flashfind portable read_dir crawl (for comparison): 20379 ms
 | metric | flashfind | fsearch |
 |---|---|---|
 | entries indexed | 1100000 | 1100000 |
-| crawl | 15.56 s | 14.88 s |
-| index build | 550 ms | 217 ms |
-| save | 57 ms | 51 ms |
-| index file size | 106 MB | 56 MB |
-| peak RSS while indexing | 365 MB | 274 MB |
-| index load (mmap + prefault) | 8 ms | 65 ms |
-| peak RSS while querying | 133 MB | 94 MB |
+| crawl | 15.54 s | 15.55 s |
+| index build | 435 ms | 211 ms |
+| save | 56 ms | 183 ms |
+| index file size | 66 MB | 56 MB |
+| peak RSS while indexing | 299 MB | 271 MB |
+| index load (mmap + prefault) | 3 ms | 2 ms |
+| peak RSS while querying | 104 MB | 94 MB |
 
 ## Query latency and accuracy
 
@@ -35,22 +35,22 @@ flashfind portable read_dir crawl (for comparison): 20379 ms
 
 | class | n | flashfind p50 | p95 | p99 | fsearch p50 | p95 | p99 | flashfind hit@1 (@10) | fsearch hit@1 (@10) |
 |---|---|---|---|---|---|---|---|---|---|
-| exact | 500 | 516 µs | 2.59 ms | 9.59 ms | 948 µs | 3.43 ms | 9.57 ms | 100% (100%) | 100% (100%) |
-| stem | 500 | 770 µs | 2.00 ms | 3.58 ms | 902 µs | 4.71 ms | 12.68 ms | 100% (100%) | 100% (100%) |
-| ext | 200 | 511 µs | 1.26 ms | 4.95 ms | 1.14 ms | 4.32 ms | 11.37 ms | 100% (100%) | 100% (100%) |
-| multi | 300 | 2.45 ms | 7.32 ms | 12.87 ms | 2.85 ms | 8.57 ms | 14.16 ms | 95% (98%) | 100% (100%) |
-| typo_swap | 300 | 672 µs | 1.75 ms | 2.89 ms | 851 µs | 5.01 ms | 11.89 ms | 100% (100%) | 98% (100%) |
-| typo_drop | 300 | 818 µs | 2.91 ms | 11.01 ms | 818 µs | 2.83 ms | 6.95 ms | 90% (98%) | 97% (98%) |
-| typo_insert | 300 | 606 µs | 2.37 ms | 6.31 ms | 825 µs | 3.66 ms | 12.04 ms | 98% (100%) | 97% (100%) |
-| typo_sub | 300 | 559 µs | 1.40 ms | 2.91 ms | 799 µs | 3.35 ms | 11.28 ms | 100% (100%) | 98% (100%) |
-| typo_first | 300 | 656 µs | 2.24 ms | 4.29 ms | 919 µs | 4.69 ms | 11.34 ms | 100% (100%) | 0% (0%) |
-| short1 | 130 | 1.06 ms | 2.98 ms | 4.25 ms | 5.24 ms | 32.89 ms | 54.04 ms | – | – |
-| short2 | 200 | 524 µs | 1.23 ms | 1.60 ms | 6.30 ms | 25.26 ms | 49.96 ms | – | – |
-| prefix3 | 200 | 218 µs | 447 µs | 506 µs | 3.75 ms | 17.52 ms | 37.81 ms | – | – |
-| filter_size | 150 | 366 µs | 531 µs | 626 µs | 3.19 ms | 33.67 ms | 44.99 ms | – | – |
-| filter_mtime | 150 | 102 µs | 140 µs | 173 µs | 506 µs | 10.65 ms | 40.72 ms | – | – |
-| keys | 2870 | 156 µs | 2.64 ms | 5.45 ms | 1.16 ms | 8.24 ms | 17.14 ms | 100% (100%) | 100% (100%) |
-| **all** | 6700 | 472 µs | 2.81 ms | 6.94 ms | 1.11 ms | 8.71 ms | 22.00 ms | | |
+| exact | 500 | 408 µs | 1.22 ms | 2.36 ms | 505 µs | 736 µs | 940 µs | 100% (100%) | 100% (100%) |
+| stem | 500 | 582 µs | 1.70 ms | 3.00 ms | 526 µs | 804 µs | 1.05 ms | 100% (100%) | 100% (100%) |
+| ext | 200 | 439 µs | 1.05 ms | 1.73 ms | 530 µs | 781 µs | 1.04 ms | 100% (100%) | 100% (100%) |
+| multi | 300 | 3.15 ms | 7.71 ms | 13.14 ms | 1.78 ms | 3.14 ms | 3.91 ms | 100% (100%) | 100% (100%) |
+| typo_swap | 300 | 545 µs | 1.63 ms | 2.85 ms | 510 µs | 731 µs | 920 µs | 100% (100%) | 98% (100%) |
+| typo_drop | 300 | 680 µs | 2.37 ms | 4.83 ms | 518 µs | 866 µs | 1.04 ms | 90% (98%) | 97% (98%) |
+| typo_insert | 300 | 473 µs | 1.19 ms | 1.90 ms | 518 µs | 721 µs | 1.26 ms | 98% (100%) | 97% (100%) |
+| typo_sub | 300 | 525 µs | 1.86 ms | 7.69 ms | 482 µs | 686 µs | 818 µs | 100% (100%) | 98% (100%) |
+| typo_first | 300 | 531 µs | 1.26 ms | 2.02 ms | 476 µs | 616 µs | 747 µs | 100% (100%) | 0% (0%) |
+| short1 | 130 | 952 µs | 2.90 ms | 4.41 ms | 3.08 ms | 4.76 ms | 5.58 ms | – | – |
+| short2 | 200 | 401 µs | 860 µs | 1.08 ms | 2.85 ms | 4.90 ms | 5.84 ms | – | – |
+| prefix3 | 200 | 186 µs | 333 µs | 350 µs | 1.79 ms | 3.22 ms | 3.63 ms | – | – |
+| filter_size | 150 | 308 µs | 377 µs | 552 µs | 1.77 ms | 3.07 ms | 9.52 ms | – | – |
+| filter_mtime | 150 | 119 µs | 166 µs | 205 µs | 398 µs | 596 µs | 936 µs | – | – |
+| keys | 2870 | 129 µs | 2.24 ms | 4.23 ms | 792 µs | 3.78 ms | 5.26 ms | 100% (100%) | 100% (100%) |
+| **all** | 6700 | 393 µs | 2.64 ms | 5.72 ms | 570 µs | 3.41 ms | 4.82 ms | | |
 
 ## Notes
 
@@ -58,4 +58,12 @@ flashfind portable read_dir crawl (for comparison): 20379 ms
 - Synthetic tree, warm metadata cache (a warm-up crawl runs first). Real disks have a different name distribution (more duplicate names, deeper system trees); treat these as engine comparisons, not whole-disk predictions.
 - `hit@1` uses flashfind's own generator, so read it as a sanity check rather than an independent quality benchmark. fsearch, by design, does not forgive a typo in the first character (`typo_first`) or a 4-letter-or-shorter typo.
 - `keys` replays typing each target name one character at a time in one search session; both engines narrow from the previous keystroke (fsearch via its name cache, flashfind via `Session`).
+- The machine was busy (load average shown under Machine; Spotlight and other user processes). Each engine ran twice, alternating, and the better run is reported; absolute numbers move between runs.
 
+
+## Live updates (macOS FSEvents)
+
+From `cargo test --release -p flashfind-core --test live fsevents -- --nocapture` on the same Mac at
+the same time (load ~100): create / rename / delete a file and create a new folder in a watched temp
+folder, then poll the search until the change shows up. Event-to-searchable latency over 31 changes:
+**p50 30 ms, max 90 ms** (the FSEvents coalescing latency is set to 30 ms, which accounts for most of it).

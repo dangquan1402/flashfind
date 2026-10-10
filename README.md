@@ -1,17 +1,27 @@
 # flashfind
 
-A whole-disk file **name** search engine for macOS (portable to Linux), written
-in Rust and built to be linked **in-process** into an app and queried on every
-keystroke. It is a re-engineering of the ideas in
-[fsearch](https://github.com/noahdunnagan/fsearch), aimed at lower and
-more predictable per-keystroke latency, typo tolerance anywhere in a word, and
-an FFI surface a Swift app can call directly.
+**Find anything across all your code projects, instantly, for you and your
+AI coding agent.**
 
-> **Status: phase 0 + phase 1 MVP.** The index, crawler, query language,
-> search engine, CLI, C ABI and benchmark harness work and are tested on Linux
-> and macOS (Apple Silicon). There is **no live updating yet** (FSEvents is a
-> TODO; re-run `flashfind index`), no content search and no app. Not published
-> to crates.io.
+flashfind discovers every git repository under your home folder and builds
+one index of what is actually *in* them: `.gitignore` is honoured and
+`node_modules`, `target`, `build`, `dist`, `DerivedData`, `.venv`, `Pods`,
+`.git` internals and the like are left out. Then it answers fuzzy,
+typo-tolerant file-name queries across all of them in well under a
+millisecond, grouped by repo, with recently active repos first. It does this
+from the command line, as JSON, or as an **MCP server** that Cursor, Claude
+Code and other agents can call instead of running `find`/`ls` on every repo.
+
+Underneath is a general whole-disk file-name engine for macOS (portable to
+Linux) built to be linked in-process and queried on every keystroke, with
+live FSEvents updates. That engine is a re-engineering of
+[fsearch](https://github.com/noahdunnagan/fsearch); see Credits.
+
+> **Status: early, works, tested on Linux and macOS (Apple Silicon).** Code
+> projects mode (discovery, gitignore-aware index, `repo:`/`lang:`/`dirty:`,
+> CLI, MCP) is new in this version. The code index is rebuilt (about 0.1 s per
+> 200 repos), not live-watched yet. There's no content search and no app yet.
+> Not on crates.io.
 
 ## Credits
 
@@ -38,8 +48,124 @@ flashfind stands on two MIT-licensed projects. Full license texts are in
   with query length (fff's matcher, frizbee); and a bigram prefilter (fff uses
   one for content search; flashfind uses a per-name bigram signature to skip
   names that can't be within the typo budget). frizbee itself is not used.
+  fff's focus on *projects* (git-aware, project-scoped search for editors and
+  agents) also shaped the code-projects mode.
+- The code index uses the [`ignore`](https://crates.io/crates/ignore) crate
+  by Andrew Gallant (MIT/Unlicense, the walker behind ripgrep) for
+  `.gitignore` semantics.
 
-## What is different from fsearch
+## Code projects
+
+```sh
+cargo build --release      # Rust 1.88+
+FF=./target/release/flashfind
+
+$FF projects                          # every repo under ~, most recently active first
+$FF code router                       # fuzzy file/folder name search across all repos
+$FF code auth middleware              # folder + name: matches src/auth/middleware.ts
+$FF code 'repo:api lang:ts router'    # one project (exact, prefix or substring of its name), TypeScript only
+$FF code dirty: lang:rust             # files with uncommitted changes (runs git status in the matched repos)
+$FF code --recent 2d                  # most recently modified files across repos
+$FF code --json 'invoce'              # compact JSON grouped by repo (typo-tolerant)
+```
+
+`flashfind code` output is grouped by repo:
+
+```
+payment-vault  (~/work/globex/payment-vault, 2h ago)
+    src/signer/token.go
+model-retry  (~/oss/model-retry, 14d ago)
+    src/signer/tokenForm.ts
+```
+
+- **Roots:** `--root DIR` (repeatable or comma-separated), or
+  `FLASHFIND_CODE_ROOTS` (`:`-separated); default `~`. Discovery skips
+  `Library`, `Applications`, media folders, hidden folders, `*.app` and the junk
+  list, and it doesn't search inside a repo for more repos, so submodules are
+  part of their parent.
+- **What is indexed:** everything `git` would show, plus untracked files that
+  aren't ignored. Hidden files such as `.github/` and `.env.example` are kept.
+  Rules come from `.gitignore`, `.git/info/exclude`, the global excludes file
+  and `.ignore`. Folders named `node_modules`, `target`, `build`, `dist`,
+  `out`, `DerivedData`, `.build`, `.venv`, `venv`, `__pycache__`, `Pods`,
+  `.gradle`, `.next`, `.turbo`, `.cache`, `coverage`, `.idea`, … are skipped
+  even when not ignored (`--no-default-excludes` turns this off;
+  `--no-gitignore` disables ignore files).
+- **Ranking:** the usual flashfind score (exact > stem > prefix > word >
+  substring > fuzzy > typo, folder parts of a multi-word query matched against
+  parent folders), plus a small boost for repos active in the last day, week,
+  month or half year. The repo's last activity is the later of its last
+  commit (read from `.git/logs/HEAD`, no git process) and `.git/index`.
+  The boost only reorders results within a score band.
+- **Filters** on top of the normal query language: `repo:<name>[,<name>]`,
+  `lang:<rust|ts|js|py|go|swift|c|cpp|java|kotlin|ruby|php|cs|zig|lua|sh|md|…>`,
+  and `dirty:`. The usual `ext:`, `type:`, `size:`, `mtime:`, `!exclude` and
+  `=exact` work too.
+- **Cache:** `~/.cache/flashfind` (`FLASHFIND_CACHE`), rebuilt when older than
+  `--max-age` seconds (default 600) or with `--refresh`.
+
+### MCP server (Cursor, Claude Code, …)
+
+`flashfind mcp` speaks MCP over stdio and exposes:
+
+| tool | arguments | returns |
+|---|---|---|
+| `find_files` | `query`, optional `repo`, `lang`, `dirty`, `limit` (20) | `{total, groups:[{repo, root, files:[paths relative to root]}]}` |
+| `list_projects` | optional `filter`, `limit` (50) | `{total, projects:[{name, root, branch, last_commit, active, entries}]}` |
+| `recent_files` | optional `repo`, `lang`, `within` (`7d`), `limit` | same shape as `find_files`, newest first |
+| `reindex` | – | rediscover and rebuild now |
+
+The index is loaded from the cache (or built) at startup and rebuilt in the
+background when older than `--max-age` (default 300 s). Results list each
+repo root once, with paths relative to it, to keep agent context small.
+
+**Cursor:** add to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project):
+
+```json
+{
+  "mcpServers": {
+    "flashfind": { "command": "/absolute/path/to/flashfind", "args": ["mcp"] }
+  }
+}
+```
+
+**Claude Code:**
+
+```sh
+claude mcp add flashfind -- /absolute/path/to/flashfind mcp
+# limit it to some folders:
+claude mcp add flashfind -- /absolute/path/to/flashfind mcp --root ~/dev --root ~/work
+```
+
+Any other MCP client works the same way: the command is `flashfind mcp`.
+
+### Code benchmark (Apple M5 Pro, synthetic 200-repo home)
+
+`bench/run-code.sh` generates 200 repos (Rust, TS, JS, Python, Swift, Go)
+with sources plus realistic junk (`node_modules`, `target`, `.venv`,
+`.build`/`DerivedData`, `.git` objects, gitignored logs) and 20 k files under
+`Library/`. Then it compares the code index with a plain index of the same
+folder. Both use the same engine. Full table: [bench/CODE_RESULTS.md](bench/CODE_RESULTS.md).
+
+| | code index | plain whole-tree index |
+|---|---|---|
+| entries indexed | 30.6 k | 271.5 k (**88.7% junk/ignored**) |
+| index size | 1.6 MB | 13.4 MB |
+| discover + crawl + build | 20 + 69 + 51 ms | 868 ms |
+| junk in the top 10 results | **0%** | 32–54% |
+| query p50 / p95 (bare name) | **219 µs / 1.33 ms** | 559 µs / 8.88 ms |
+| `repo:<name> <stem>` hit@1 | **94%** | 50% (no repo filter) |
+| folder + name hit@1 | 88% | 89% |
+
+Caveats: the machine was very busy (load average 85–143), so treat the latency
+as indicative. Bare-name hit@1 is only about 51% for both because the
+synthetic vocabulary repeats file names across repos (hit@10 is 84–89%).
+These are flashfind's own synthetic data and queries. Real homes haven't been
+measured; on the Mac, discovery was only run on the synthetic tree.
+
+## Whole-disk engine
+
+### What is different from fsearch
 
 | | fsearch | flashfind |
 |---|---|---|
@@ -51,58 +177,79 @@ flashfind stands on two MIT-licensed projects. Full license texts are in
 | `mtime:3d` | 1-second window (bug) | "within 3 days" |
 | `mtime:>140y` | u32 wrap-around (bug) | saturating i64 arithmetic |
 | Paths deeper than 256 levels | truncated (bug) | no depth limit |
-| Sizes / mtimes | u32 (sizes lossy above 2 GiB) | exact u64 / i64 |
+| Sizes / mtimes | u32 (sizes lossy above 2 GiB) | 32 bits each: sizes exact below 2 GiB, MiB granularity above (to 2 PiB); mtimes unsigned seconds (1970–2106); filter arithmetic in i64 |
 | Results | full list | top-k first page, with exact or lower-bound total |
 
-## Benchmarks (Apple M5 Pro, 1.1 M-entry synthetic tree)
+### Benchmarks (Apple M5 Pro, 1.1 M-entry synthetic tree)
 
 Both engines run in-process, on the same tree and queries, through their
 library APIs. Full table and method: [bench/RESULTS.md](bench/RESULTS.md).
+"previous" is the last published flashfind run (the older `FFIDX004`
+index format). Both runs were on a busy machine.
 
-| | flashfind | fsearch |
-|---|---|---|
-| all queries p50 / p95 / p99 | **472 µs / 2.81 ms / 6.94 ms** | 1.11 ms / 8.71 ms / 22.0 ms |
-| per keystroke (typing a name) p50 / p95 | **156 µs / 2.64 ms** | 1.16 ms / 8.24 ms |
-| 1-letter queries p50 | **1.06 ms** | 5.24 ms |
-| typo in first letter, hit@1 | **100%** | 0% (by design) |
-| typo_drop hit@1 | 90% | **97%** |
-| multi-word (folder + name) hit@1 | 95% | **100%** |
-| crawl (getattrlistbulk) | 15.6 s | **14.9 s** |
-| index build | 550 ms | **217 ms** |
-| index file | 106 MB | **56 MB** |
-| RSS while querying | 133 MB | **94 MB** |
+| | flashfind now | flashfind previous | fsearch (this run) |
+|---|---|---|---|
+| all queries p50 / p95 / p99 | **393 µs** / 2.64 ms / 5.72 ms | 472 µs / 2.81 ms / 6.94 ms | 570 µs / 3.41 ms / **4.82 ms** |
+| per keystroke (typing a name) p50 / p95 | **129 µs / 2.24 ms** | 156 µs / 2.64 ms | 792 µs / 3.78 ms |
+| 1 / 2 / 3-letter queries p50 | **952 / 401 / 186 µs** | 1.06 ms / – / – | 3.08 / 2.85 / 1.79 ms |
+| exact / stem / typo p50 | 408–680 µs | – | **476–526 µs** |
+| exact / stem / typo p95 | 1.2–2.4 ms | – | **0.6–0.9 ms** |
+| multi-word (folder + name) p50 / hit@1 | 3.15 ms / **100%** | – / 95% | **1.78 ms / 100%** |
+| typo in first letter, hit@1 | **100%** | 100% | 0% (by design) |
+| typo_drop hit@1 | 90% | 90% | **97%** |
+| crawl (getattrlistbulk) | 15.5 s | 15.6 s | 15.6 s |
+| index build | 435 ms | 550 ms | **211 ms** |
+| index file | 66 MB | 106 MB | **56 MB** |
+| RSS while querying | 104 MB | 133 MB | **94 MB** |
+| file change → searchable (FSEvents) | p50 30 ms, max 90 ms | no live updates | not measured |
 
 Read these numbers with care:
 
-- **Where flashfind is worse:** a larger index (it keeps lower- and
-  original-case names, a 16-byte bigram signature per name, and exact
-  64-bit sizes/mtimes) and more RAM; a 2.5× slower index build; a slightly
-  slower crawl; and lower hit@1 on dropped-letter typos and folder+name queries.
-  The multi-word case is because its ancestor-folder scoring is a flat bonus.
-- **Noisy machine:** load average was 60–170 during the run (Spotlight and
-  other user processes), so each engine ran twice, alternating, and the better
-  run is shown. Expect the absolute numbers to move between runs; the ratios
-  were stable across the runs we made.
-- **Synthetic data:** names are far more unique than on a real disk (911 k
-  distinct names per 1.1 M entries; fsearch reports ~2 M per 7.5 M). The
-  generator and the hit@1 targets are flashfind's own. This is an engine
-  comparison, not a whole-disk prediction. Whole-disk runs are not done yet.
-- fsearch's socket/CLI round trip is *not* included; in a real app it adds to
-  fsearch's side.
+- **Where flashfind is worse:** its p95 on single-word name and typo queries
+  is 1.2–2.4 ms against fsearch's 0.6–0.9 ms, and at p50 they are about even.
+  Multi-word queries are now as accurate as fsearch (100%) but 1.8× slower,
+  because of the new per-folder token scoring. The index is still 18% larger,
+  RAM is 11% higher, the index build is 2× slower, and dropped-letter typos
+  hit@1 is lower (90% vs 97%).
+- **Where it is better:** short and prefix queries (3–15× faster), filters,
+  typing latency (6× lower p50), first-letter typos, live updates, and search
+  during the first crawl.
+- **Compared with the previous run:** the index is 38% smaller (106 → 66 MB),
+  query RSS is 22% lower (133 → 104 MB), and the multi-word hit@1 went from
+  95% to 100%. fsearch measured about 2× faster this run than last time
+  (p50 570 µs vs 1.11 ms) on the same tree. That fits the machine load
+  changing (load average 47–121 now vs 60–170 then), so compare columns
+  within a run rather than across runs.
+- **Synthetic data:** names are far more unique than on a real disk. This is
+  an engine comparison, not a whole-disk prediction. fsearch's socket/CLI
+  round trip is not included.
 
-## Build and use
+### Live index
 
-Requires Rust 1.88+.
+`Live` keeps the mmap'd base index and adds an in-memory overlay plus
+tombstones. Changed folders are relisted (FSEvents on macOS, gives folder
+granularity; mtime polling elsewhere) and queries search base and overlay
+together. When the overlay passes a threshold or a timer fires, it is
+compacted into a new base and saved. When event history is lost
+(`MustScanSubDirs`, dropped events, a root change), folder mtimes are
+re-checked instead of recrawling. The last event id is saved in the index
+header, so a restart replays only newer events. While the first crawl runs,
+queries are answered from the partial listings (with a progress indicator).
 
 ```sh
-cargo build --release
-cargo test --release --workspace
+$FF watch ~/Documents              # crawl, watch, answer one query per stdin line
+```
 
-# index a folder (or / for the whole disk, with Full Disk Access)
-./target/release/flashfind index ~/Documents -o ~/.flashfind/index.ffx
-./target/release/flashfind search 'invoce ext:pdf mtime:<30d'
-./target/release/flashfind search --explain --limit 20 'q3 reprot'
-./target/release/flashfind help query
+C API: `ff_live_crawl` / `ff_live_open`, `ff_live_watch`, `ff_live_progress`,
+`ff_live_session_new` + `ff_search`, `ff_live_checkpoint`.
+
+### Use
+
+```sh
+$FF index ~/Documents -o ~/.flashfind/index.ffx   # or / with Full Disk Access
+$FF search 'invoce ext:pdf mtime:<30d'
+$FF search --explain --limit 20 'q3 reprot'
+$FF help query
 ```
 
 Query language: plain words are fuzzy and must all match the name or a parent
@@ -113,34 +260,37 @@ exclude; filters `ext:` `type:` `size:` `mtime:` `in:` `limit:`.
 
 `crates/flashfind-ffi` builds `libflashfind.a` / `.dylib`; the header is
 [`crates/flashfind-ffi/include/flashfind.h`](crates/flashfind-ffi/include/flashfind.h).
-Open an index (mmap, about 8 ms for 1.1 M entries), create one session per
-search field, and for each keystroke cancel the previous token and call
-`ff_search` on a worker thread. See `crates/flashfind-ffi/examples/smoke.c`.
+Open an index (mmap, ~3 ms for 1.1 M entries) or a live index, create one
+session per search field, and for each keystroke cancel the previous token
+and call `ff_search` on a worker thread. See `crates/flashfind-ffi/examples/smoke.c`.
 
-### Reproducing the benchmark
+### Reproducing the benchmarks
 
 ```sh
 git clone https://github.com/noahdunnagan/fsearch ../fsearch   # next to this repo
-bench/run.sh 1000000 42   # writes ~1.1 M files under ~/dev/flashfind-bench, then bench/RESULTS.md
+bench/run.sh 1000000 42    # ~1.1 M files under ~/dev/flashfind-bench → bench/RESULTS.md
+bench/run-code.sh 200 7    # 200 synthetic repos → bench/CODE_RESULTS.md
+cargo test --release --workspace
 ```
 
 ## Layout
 
 - `crates/flashfind-core`: crawler (`walk/`), index format (`index.rs`,
-  mmap-able `FFIDX004`), matcher (`matcher.rs`), query parser (`query.rs`) and
-  engine (`search.rs`: name phase → entry phase, narrowing, prefix early exit,
-  clean-first typo gate, cancellation)
-- `crates/flashfind-cli`: the `flashfind` binary (`index`, `search`, `gen`,
-  `bench`, `report`)
+  mmap-able `FFIDX005`), matcher (`matcher.rs`), query parser (`query.rs`),
+  engine (`search.rs`), live overlay + compaction (`live.rs`), FSEvents /
+  polling (`watch.rs`)
+- `crates/flashfind-code`: repo discovery, gitignore-aware code index,
+  `repo:`/`lang:`/`dirty:`, grouping, MCP server (`mcp.rs`)
+- `crates/flashfind-cli`: the `flashfind` binary
 - `crates/flashfind-ffi`: C ABI
-- `bench/`: run script, fsearch baseline harness, results
+- `bench/`: run scripts, fsearch baseline harness, results
 
 ## Roadmap
 
-FSEvents live updates (overlay + tombstones), searching while the first crawl
-runs, better ancestor-folder scoring, a smaller index (drop duplicate-case name
-copies, narrower size/mtime), whole-disk and real-tree benchmarks
-(Chromium, Linux), a Swift demo app, then content search.
+Live-watch the code index (FSEvents + gitignore-aware relisting), let the MCP
+server search file contents in the matched repos, recent-files ranking from
+git history, close the p95 gap on name/typo queries and the multi-word
+slowdown, a Swift demo app over the C API, real-home benchmarks.
 
 ## License
 

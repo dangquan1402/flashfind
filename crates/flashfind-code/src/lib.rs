@@ -213,7 +213,8 @@ pub fn discover(cfg: &Config) -> Vec<Repo> {
                 }
                 if e.depth() > 0 {
                     let name = e.file_name().to_string_lossy();
-                    if skip.iter().any(|s| *s == name) || name.ends_with(".app") || name.ends_with(".photoslibrary") {
+                    // `.noindex` is macOS's "don't index this folder" convention.
+                    if skip.iter().any(|s| *s == name) || name.ends_with(".app") || name.ends_with(".photoslibrary") || name.ends_with(".noindex") {
                         return false;
                     }
                     if git_dir(e.path()).is_some() {

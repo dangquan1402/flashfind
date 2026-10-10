@@ -70,6 +70,7 @@ fn main() {
     if std::env::var("STAGES").is_ok() {
         stages(&ci, &qs);
         stages2(&ci, &qs);
+        stages3(&ci, &qs);
         return;
     }
     let cancel = CancelToken::new();
@@ -201,4 +202,60 @@ pub fn stages2(ci: &CodeIndex, qs: &[(String, String)]) {
     let q = qn as f64;
     println!("single-thread per query: gather {:.0} µs ({:.0} surv) | sig-check {:.0} µs ({:.0} pass) | score {:.0} µs ({:.1} match)",
         tg / q * 1e6, nsurv as f64 / q, tc / q * 1e6, ncand as f64 / q, ts / q * 1e6, nscore as f64 / q);
+}
+
+#[allow(dead_code)]
+pub fn stages3(ci: &CodeIndex, qs: &[(String, String)]) {
+    use flashfind_core::matcher::may_match;
+    let idx = &ci.idx;
+    let (masks, sigs) = (idx.name_mask(), idx.name_sig());
+    let mut cand = vec![0u32; idx.u];
+    let (mut tg, mut tclean, mut ttypo, mut nclean, mut ntypo, mut nq) = (0f64, 0f64, 0f64, 0u64, 0u64, 0usize);
+    let (mut nlen, mut nmasklen) = (0u64, 0u64);
+    for (_, q) in qs.iter().take(300) {
+        let qq = Query::parse(q).unwrap();
+        let Some(tok) = qq.tokens.first() else { continue };
+        let p = &tok.pat;
+        if p.typos == 0 { continue; }
+        nq += 1;
+        let t = Instant::now();
+        let mut n = 0;
+        for (i, (&m, &sg)) in masks.iter().zip(sigs).enumerate() {
+            cand[n] = i as u32;
+            n += (may_match(p.mask, 0, m) | (may_match(p.mask, p.typos, m) && p.sig_ok(sg))) as usize;
+        }
+        tg += t.elapsed().as_secs_f64();
+        let off = idx.name_off();
+        let m = p.text.len();
+        nlen += cand[..n].iter().filter(|&&id| (off[id as usize + 1] - off[id as usize]) as usize + p.typos as usize >= m).count() as u64;
+        let mut nk = 0u64;
+        for (i, &mk) in masks.iter().enumerate() {
+            nk += (may_match(p.mask, p.typos, mk) && (off[i + 1] - off[i]) as usize + p.typos as usize >= m) as u64;
+        }
+        nmasklen += nk;
+        let mut x = 0usize;
+        let t = Instant::now();
+        for &id in &cand[..n] {
+            let m = masks[id as usize];
+            if may_match(p.mask, 0, m) {
+                nclean += 1;
+                x += tok.score_m(idx.lower(id), idx.orig(id), idx.sig(id), m, true).is_some() as usize;
+            }
+        }
+        tclean += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        for &id in &cand[..n] {
+            let m = masks[id as usize];
+            if !may_match(p.mask, 0, m) {
+                ntypo += 1;
+                x += tok.score_m(idx.lower(id), idx.orig(id), idx.sig(id), m, true).is_some() as usize;
+            }
+        }
+        ttypo += t.elapsed().as_secs_f64();
+        std::hint::black_box(x);
+    }
+    let q = nq as f64;
+    println!("1-thread per query ({nq} q): gather+fold {:.0} µs | clean-cands {:.0} µs ({:.0}) | typo-only cands {:.0} µs ({:.0})",
+        tg / q * 1e6, tclean / q * 1e6, nclean as f64 / q, ttypo / q * 1e6, ntypo as f64 / q);
+    println!("  of gathered, pass length: {:.0}; mask(k)+length without sig: {:.0}", nlen as f64 / q, nmasklen as f64 / q);
 }

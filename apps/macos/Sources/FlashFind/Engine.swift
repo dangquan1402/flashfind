@@ -112,6 +112,21 @@ final class CodeEngine: @unchecked Sendable {
         return s
     }
 
+    /// Current project for ranking (nil clears).
+    func setCwd(_ path: String?) {
+        path.withOptionalCString { ff_code_session_set_cwd(session, $0) }
+    }
+
+    /// Guess the project of the app that was frontmost (no extra permissions).
+    func detectContext(pid: Int32, bundle: String, title: String?) -> (root: String?, how: String) {
+        let raw = bundle.withCString { b in title.withOptionalCString { t in ff_code_detect_context(code, pid, b, t) } }
+        guard let raw else { return (nil, "") }
+        defer { ff_string_free(raw) }
+        let data = Data(String(cString: raw).utf8)
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        return (obj?["root"] as? String, obj?["how"] as? String ?? "")
+    }
+
     /// Learned ranking: remember the file meant for `query`.
     func recordPick(query: String, path: String, action: String) {
         _ = query.withCString { q in path.withCString { p in action.withCString { a in ff_code_record_pick(code, q, p, a) } } }

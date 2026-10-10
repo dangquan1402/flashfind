@@ -164,3 +164,68 @@ fn frecency_decays_with_a_ten_day_half_life() {
     let f = m.recall().frecency["/a"];
     assert!((f - 0.5).abs() < 0.01, "{f}");
 }
+
+fn only(f: impl Fn(&mut Features)) -> Features {
+    let mut x = Features::BASELINE;
+    x.legacy_repo_recency = false;
+    f(&mut x);
+    x
+}
+
+#[test]
+fn current_project_ranks_first() {
+    let (home, live) = many("ctx");
+    let mut r = Ranker::new(None);
+    r.features = only(|f| f.context = true);
+    r.cwd = Some(home.join("dev/repo12/src"));
+    let mut sess = CodeSession::with_ranker(live.clone(), r);
+    let t = top(&mut sess, "readme");
+    assert!(t[0].ends_with("dev/repo12/README.md"), "{t:?}");
+    // From the frontmost app's window title.
+    let repos = live.repos();
+    assert_eq!(context::from_title("router.ts — repo07", &repos).map(|r| r.name.as_str()), Some("repo07"));
+    assert_eq!(context::from_title("Slack | general", &repos).map(|r| r.name.as_str()), None);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn dirty_and_recently_committed_files_rank_higher() {
+    let (home, live) = many("git");
+    let mut r = Ranker::new(None);
+    r.features = only(|f| f.git = true);
+    let root = home.join("dev/repo21");
+    let mut g = git::GitInfo::default();
+    g.dirty.insert(root.join("src/router.ts").to_string_lossy().into_owned());
+    g.recent.insert(root.join("README.md").to_string_lossy().into_owned(), 0);
+    r.git.pin(&root, g);
+    // Git info of the current project is used right away.
+    r.cwd = Some(root.clone());
+    let mut sess = CodeSession::with_ranker(live.clone(), r);
+    let want = root.join("src/router.ts").to_string_lossy().into_owned();
+    assert_eq!(top(&mut sess, "router")[0], want);
+    assert!(top(&mut sess, "readme")[0].ends_with("repo21/README.md"));
+    let mut cq = CodeQuery::parse("router");
+    cq.limit = 3;
+    let h = sess.search(&cq, &flashfind_core::CancelToken::new()).unwrap();
+    assert_eq!(h.hits[0].why, "uncommitted");
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn real_git_status_and_log() {
+    let d = tmpdir("realgit");
+    let ok = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&d).args(args).output().is_ok_and(|o| o.status.success());
+    if !ok(&["init", "-q"]) {
+        return; // no git
+    }
+    put(&d, "a.rs");
+    put(&d, "b.rs");
+    ok(&["add", "a.rs"]);
+    ok(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "a"]);
+    let g = git::GitInfo::load(&d);
+    let a = d.join("a.rs").to_string_lossy().into_owned();
+    let b = d.join("b.rs").to_string_lossy().into_owned();
+    assert_eq!(g.recent.get(&a), Some(&0));
+    assert!(g.is_dirty(&b) && !g.is_dirty(&a));
+    let _ = std::fs::remove_dir_all(d);
+}

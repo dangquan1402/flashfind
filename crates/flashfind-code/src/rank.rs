@@ -11,15 +11,19 @@
 //! boost% = 60 · query_memory          (0..1: picks for this query or one it prefixes)
 //!        + 25 · frecency              (0..1: decayed picks + edits of this file, 10-day half-life)
 //!        +  5 · repo frecency + ≤5 repo recency   (mild project-level terms)
+//!        + 15 if in the current project (+5 more under the current folder)
+//!        + 10 if it has uncommitted changes, + 8 / 4 if in the last 3 / 10 commits
 //! ```
 //!
 //! Hits the matcher would rank too low to be fetched at all (the file you
 //! picked for `readme` among 300 READMEs) are pulled in by a second, masked
 //! search over just the remembered files, so learning works at any scale.
 
-use crate::CodeHit;
+use crate::git::{GitCache, GitInfo};
 use crate::memory::{Memory, Recall};
+use crate::{CodeHit, Repo};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Which signals to use (the eval turns them on one by one).
@@ -29,6 +33,10 @@ pub struct Features {
     pub memory: bool,
     /// Per-file frecency (picks + edits) and the mild repo terms.
     pub frecency: bool,
+    /// Current-project boost (from `cwd` / the frontmost app).
+    pub context: bool,
+    /// Uncommitted and recently committed files.
+    pub git: bool,
     /// The pre-0.2 additive repo-recency bonus (+30/20/10/4 within a band).
     pub legacy_repo_recency: bool,
 }
@@ -38,12 +46,16 @@ impl Features {
     pub const ALL: Features = Features {
         memory: true,
         frecency: true,
+        context: true,
+        git: true,
         legacy_repo_recency: false,
     };
     /// flashfind 0.1 ranking.
     pub const BASELINE: Features = Features {
         memory: false,
         frecency: false,
+        context: false,
+        git: false,
         legacy_repo_recency: true,
     };
 }
@@ -57,6 +69,10 @@ impl Default for Features {
 pub const W_MEMORY: f64 = 60.0;
 pub const W_FRECENCY: f64 = 25.0;
 pub const W_REPO_FRECENCY: f64 = 5.0;
+pub const W_PROJECT: f64 = 15.0;
+pub const W_FOLDER: f64 = 5.0;
+pub const W_DIRTY: f64 = 10.0;
+pub const W_RECENT_COMMIT: (f64, f64) = (8.0, 4.0);
 
 /// Mild repo recency (percent) for a repo active `age` seconds ago.
 pub fn repo_recency_pct(age: i64) -> f64 {
@@ -74,6 +90,9 @@ pub fn repo_recency_pct(age: i64) -> f64 {
 pub struct Ranker {
     pub memory: Option<Arc<Memory>>,
     pub features: Features,
+    /// Current folder (explicit `--cwd` / MCP `cwd`, or detected project).
+    pub cwd: Option<PathBuf>,
+    pub git: Arc<GitCache>,
 }
 
 impl Ranker {
@@ -81,6 +100,8 @@ impl Ranker {
         Ranker {
             memory,
             features: Features::ALL,
+            cwd: None,
+            git: GitCache::new(),
         }
     }
 
@@ -88,11 +109,13 @@ impl Ranker {
         Ranker {
             memory: None,
             features: Features::BASELINE,
+            cwd: None,
+            git: GitCache::new(),
         }
     }
 
-    /// Per-search inputs for the typed query.
-    pub fn input(&self, text: &str) -> RankInput {
+    /// Per-search inputs for the typed query (`repos`: to resolve `cwd`).
+    pub fn input(&self, text: &str, repos: &[Repo]) -> RankInput {
         let f = self.features;
         let recall = self.memory.as_ref().filter(|_| f.memory || f.frecency).map(|m| m.recall());
         let qmem = match (&recall, f.memory) {
@@ -103,6 +126,26 @@ impl Ranker {
             (Some(r), true) => r.top_frecent(200).into_iter().map(|(p, _)| p).collect(),
             _ => Vec::new(),
         };
+        let ctx = if f.context || f.git {
+            self.cwd.as_deref().and_then(|c| crate::context::repo_for(c, repos)).map(|r| r.path.clone())
+        } else {
+            None
+        };
+        let ctx_dir = match (&ctx, &self.cwd) {
+            (Some(r), Some(c)) if c != r && c.starts_with(r) => Some(c.to_string_lossy().into_owned() + "/"),
+            _ => None,
+        };
+        let ctx_git = match (&ctx, f.git) {
+            (Some(r), true) => self.git.get(r, true),
+            _ => None,
+        };
+        let mut ctx_files: Vec<String> = Vec::new();
+        if let Some(g) = &ctx_git {
+            ctx_files.extend(g.dirty.iter().take(100).cloned());
+            let mut rec: Vec<(&String, &usize)> = g.recent.iter().collect();
+            rec.sort_by_key(|(p, i)| (**i, (*p).clone()));
+            ctx_files.extend(rec.into_iter().take(100).map(|(p, _)| p.clone()));
+        }
         RankInput {
             features: f,
             now: self.memory.as_ref().map_or_else(crate::memory::now, |m| m.now()),
@@ -110,6 +153,11 @@ impl Ranker {
             qmem,
             frecent,
             repo_frec: Default::default(),
+            ctx_root: ctx.as_ref().map(|r| r.to_string_lossy().into_owned()),
+            ctx_dir,
+            ctx_files,
+            git: f.git.then(|| self.git.clone()),
+            git_infos: Default::default(),
         }
     }
 }
@@ -124,6 +172,14 @@ pub struct RankInput {
     /// The most frecent files (candidates).
     pub frecent: Vec<String>,
     repo_frec: Mutex<HashMap<String, f64>>,
+    /// Root of the current project's repo.
+    pub ctx_root: Option<String>,
+    /// Current folder below that root (with trailing '/').
+    pub ctx_dir: Option<String>,
+    /// Dirty / recently committed files of the current project (candidates).
+    pub ctx_files: Vec<String>,
+    git: Option<Arc<GitCache>>,
+    git_infos: Mutex<HashMap<String, Option<Arc<GitInfo>>>>,
 }
 
 impl RankInput {
@@ -135,6 +191,11 @@ impl RankInput {
             qmem: HashMap::new(),
             frecent: Vec::new(),
             repo_frec: Default::default(),
+            ctx_root: None,
+            ctx_dir: None,
+            ctx_files: Vec::new(),
+            git: None,
+            git_infos: Default::default(),
         }
     }
 
@@ -142,6 +203,7 @@ impl RankInput {
     pub fn candidates(&self) -> Vec<&str> {
         let mut v: Vec<&str> = self.qmem.keys().map(String::as_str).collect();
         v.extend(self.frecent.iter().map(String::as_str));
+        v.extend(self.ctx_files.iter().map(String::as_str));
         v.sort_unstable();
         v.dedup();
         v
@@ -174,7 +236,39 @@ impl RankInput {
             }
             p += repo_recency_pct(self.now - h.repo_active);
         }
+        if self.features.context
+            && let Some(root) = &self.ctx_root
+            && h.repo_root == *root
+        {
+            p += W_PROJECT;
+            if self.ctx_dir.as_ref().is_some_and(|d| h.path.starts_with(d.as_str())) {
+                p += W_FOLDER;
+            }
+            why.push("this project");
+        }
+        if let Some(g) = self.git_info(&h.repo_root) {
+            if g.is_dirty(&h.path) {
+                p += W_DIRTY;
+                why.push("uncommitted");
+            }
+            if let Some(&i) = g.recent.get(&h.path) {
+                p += if i < 3 { W_RECENT_COMMIT.0 } else { W_RECENT_COMMIT.1 };
+                why.push("recent commit");
+            }
+        }
         (p, why)
+    }
+
+    /// Git info for a repo: the current project's is loaded synchronously,
+    /// others come from the background cache when ready.
+    pub fn git_info(&self, root: &str) -> Option<Arc<GitInfo>> {
+        let git = self.git.as_ref()?;
+        self.git_infos
+            .lock()
+            .unwrap()
+            .entry(root.to_string())
+            .or_insert_with(|| git.get(Path::new(root), self.ctx_root.as_deref() == Some(root)))
+            .clone()
     }
 }
 

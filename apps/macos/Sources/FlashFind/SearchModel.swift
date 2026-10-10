@@ -22,6 +22,7 @@ struct LaunchOptions {
     var snapshot: String?
     var windowIdFile: String?
     var quitAfter: Double?
+    var cwd: String?
 
     static func parse(_ args: [String]) -> LaunchOptions {
         var o = LaunchOptions()
@@ -35,6 +36,7 @@ struct LaunchOptions {
             case "--snapshot": o.snapshot = it.next()
             case "--window-id-file": o.windowIdFile = it.next()
             case "--quit-after": o.quitAfter = it.next().flatMap(Double.init)
+            case "--cwd": o.cwd = it.next()
             default: break
             }
         }
@@ -63,6 +65,10 @@ final class SearchModel: ObservableObject {
     @Published private(set) var hint: String?
     @Published private(set) var ready = false
     @Published private(set) var diskAvailable = false
+    /// Current project (repo root) and how it was found.
+    @Published private(set) var contextRoot: String?
+    @Published private(set) var contextHow = ""
+    private var pendingContext: (Int32, String, String?)?
 
     let opts: LaunchOptions
     var onResults: (() -> Void)?
@@ -104,6 +110,13 @@ final class SearchModel: ObservableObject {
                     self.idle = "\(s.repos) projects · \(s.entries.formatted()) files · opened in \(Int(ms)) ms · \(live)"
                     self.brief = "\(s.repos) projects · \(live)"
                     self.status = self.idle
+                    if let cwd = o.cwd {
+                        self.pendingContext = nil
+                        self.setCwd(cwd)
+                    } else if let p = self.pendingContext {
+                        self.pendingContext = nil
+                        self.setContext(pid: p.0, bundle: p.1, title: p.2)
+                    }
                 } else {
                     self.status = "Could not open projects: \(err ?? "unknown error")"
                 }
@@ -111,6 +124,34 @@ final class SearchModel: ObservableObject {
             }
         }
     }
+
+    /// The app that was frontmost when the launcher was summoned: its project
+    /// becomes the ranking context (files there, uncommitted and recently
+    /// committed ones first).
+    func setContext(pid: Int32, bundle: String, title: String?) {
+        guard let code else { pendingContext = (pid, bundle, title); return }
+        queue.async {
+            let d = code.detectContext(pid: pid, bundle: bundle, title: title)
+            if let root = d.root { code.setCwd(root) }
+            DispatchQueue.main.async {
+                if let root = d.root {
+                    self.contextRoot = root
+                    self.contextHow = d.how
+                }
+                self.search()
+            }
+        }
+    }
+
+    /// Explicit context (e.g. --cwd on the command line).
+    func setCwd(_ dir: String) {
+        guard let code else { return }
+        queue.async { code.setCwd(dir) }
+        contextRoot = dir
+        contextHow = "--cwd"
+    }
+
+    var contextName: String? { contextRoot.map { ($0 as NSString).lastPathComponent } }
 
     func modeChanged() {
         hits = []

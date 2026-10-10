@@ -612,6 +612,27 @@ pub unsafe extern "C" fn ff_code_record_pick(c: *const FfCode, query: *const c_c
     FF_OK
 }
 
+/// Current folder / project for ranking (NULL clears it). Files in that
+/// project, and its uncommitted / recently committed files, rank higher.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_session_set_cwd(s: *mut FfCodeSession, cwd: *const c_char) {
+    let Some(sess) = (unsafe { s.as_ref() }) else { return };
+    let cwd = unsafe { cstr(cwd) }.filter(|c| !c.is_empty()).map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.into()));
+    sess.0.lock().unwrap_or_else(|p| p.into_inner()).set_cwd(cwd);
+}
+
+/// Guess the current project from the frontmost app: `pid`, `bundle_id`,
+/// and the focused window's `title` if the caller could read it (NULL
+/// otherwise). JSON `{root, app, how}`; free with ff_string_free. Uses no
+/// extra permissions (storage.json of VS Code-family editors, terminal
+/// shell cwd, open files).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ff_code_detect_context(c: *const FfCode, pid: i32, bundle_id: *const c_char, title: *const c_char) -> *mut c_char {
+    let Some(c) = (unsafe { c.as_ref() }) else { return std::ptr::null_mut() };
+    let d = flashfind_code::context::detect(pid, unsafe { cstr(bundle_id) }.unwrap_or(""), unsafe { cstr(title) }, &c.0.repos());
+    CString::new(d.json()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ff_code_session_new(c: *const FfCode) -> *mut FfCodeSession {
     match unsafe { c.as_ref() } {

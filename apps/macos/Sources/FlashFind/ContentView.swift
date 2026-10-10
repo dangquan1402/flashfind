@@ -45,6 +45,11 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             HStack(spacing: 12) {
+                if let name = model.contextName, model.mode == .code {
+                    Label(name, systemImage: "scope")
+                        .lineLimit(1)
+                        .help("Current project (\(model.contextHow)): its files, uncommitted and recently committed ones rank first")
+                }
                 Text(model.status).monospacedDigit().lineLimit(1).truncationMode(.tail).layoutPriority(1)
                 Spacer(minLength: 8)
                 Text("↩ open · ⌘↩ reveal · ⌥↩ Cursor · ⌘Y preview · ⌘C copy")

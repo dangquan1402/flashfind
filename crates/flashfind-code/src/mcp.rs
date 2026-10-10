@@ -38,6 +38,7 @@ fn tools() -> Value {
                     "repo": {"type": "string", "description": "Restrict to projects whose name matches (exact, prefix or substring)."},
                     "lang": {"type": "string", "description": "Restrict to a language's file extensions."},
                     "dirty": {"type": "boolean", "description": "Only files with uncommitted changes (runs git status)."},
+                    "cwd": {"type": "string", "description": "Your working directory: files of that project (and its uncommitted / recently committed files) rank first."},
                     "limit": {"type": "integer", "description": "Max results (default 20, max 200)."}
                 },
                 "required": []
@@ -178,7 +179,11 @@ impl Server {
                 }
                 let mut cq = CodeQuery::parse(&text);
                 cq.limit = limit(20);
-                let r = self.sess.lock().unwrap().search(&cq, &CancelToken::new())?;
+                let cwd = s("cwd").map(PathBuf::from).or_else(|| std::env::current_dir().ok());
+                let mut sess = self.sess.lock().unwrap();
+                sess.set_cwd(cwd.and_then(|c| std::fs::canonicalize(c).ok()));
+                let r = sess.search(&cq, &CancelToken::new())?;
+                drop(sess);
                 if self.memory.is_some() && !cq.text.trim().is_empty() {
                     let top: Vec<String> = r.hits.iter().take(10).map(|h| h.path.clone()).collect();
                     let mut a = self.answers.lock().unwrap();

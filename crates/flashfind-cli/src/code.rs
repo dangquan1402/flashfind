@@ -141,9 +141,17 @@ pub fn cmd_code(mut a: Args) {
     let recent = a.opt(&["--recent"]);
     let pick: Option<usize> = a.opt(&["--pick"]).map(|v| v.parse().unwrap_or_else(|_| die("--pick needs a result number (1 = first)")));
     let action = a.opt(&["--action"]).unwrap_or_else(|| "open".into());
+    let cwd_opt = a.opt(&["--cwd"]);
     let mem = memory(&mut a);
     let live = open(&mut a, &cfg);
-    let ranker = if baseline { Ranker::baseline() } else { Ranker::new(Some(mem.clone())) };
+    let mut ranker = if baseline { Ranker::baseline() } else { Ranker::new(Some(mem.clone())) };
+    // Current project: --cwd DIR, --cwd front (frontmost app), else this shell's folder.
+    ranker.cwd = match cwd_opt.as_deref() {
+        Some("front") => flashfind_code::context::frontmost()
+            .and_then(|(pid, b)| flashfind_code::context::detect(pid, &b, None, &live.repos()).root),
+        Some(d) => std::fs::canonicalize(d).ok(),
+        None => std::env::current_dir().ok().and_then(|d| std::fs::canonicalize(d).ok()),
+    };
     let mut sess = CodeSession::with_ranker(live.clone(), ranker);
     let text = a.rest().join(" ");
     let mut cq = CodeQuery::parse(&text);
@@ -200,6 +208,22 @@ pub fn cmd_code(mut a: Args) {
         }
     }
     eprintln!("{} matches in {} µs", r.total, r.elapsed_us);
+}
+
+/// `flashfind context [--pid P --bundle ID --title T]`: which project the
+/// frontmost app (or the given one) is in, as the launcher sees it.
+pub fn cmd_context(mut a: Args) {
+    let cfg = config(&mut a);
+    let pid: Option<i32> = a.opt(&["--pid"]).and_then(|v| v.parse().ok());
+    let bundle = a.opt(&["--bundle"]);
+    let title = a.opt(&["--title"]);
+    let live = open(&mut a, &cfg);
+    let (pid, bundle) = match (pid, bundle) {
+        (Some(p), Some(b)) => (p, b),
+        _ => flashfind_code::context::frontmost().unwrap_or_else(|| die("no frontmost app (lsappinfo unavailable?)")),
+    };
+    let d = flashfind_code::context::detect(pid, &bundle, title.as_deref(), &live.repos());
+    println!("{}", serde_json::to_string_pretty(&d).unwrap());
 }
 
 /// `flashfind pick <path> [--query Q] [--action A]`: tell flashfind which

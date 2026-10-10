@@ -121,8 +121,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func diskMode() { model.mode = .disk; show() }
 
     func show() {
+        captureFrontmost()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    /// Before we take focus: which app (and window title, if readable) was in front.
+    /// Window titles of other apps need Screen Recording permission; we only
+    /// read them if that was already granted (no prompt).
+    private func captureFrontmost() {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        var title: String?
+        if CGPreflightScreenCaptureAccess(),
+           let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            title = list.first(where: { ($0[kCGWindowOwnerPID as String] as? Int32) == app.processIdentifier && ($0[kCGWindowLayer as String] as? Int) == 0 })?[kCGWindowName as String] as? String
+        }
+        model.setContext(pid: app.processIdentifier, bundle: app.bundleIdentifier ?? app.localizedName ?? "", title: title)
     }
 
     func toggle() {

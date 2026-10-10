@@ -11,6 +11,8 @@
 //!   boosts recently active repos and groups results by repo.
 //! * [`mcp`] serves it to AI coding agents over MCP (stdio).
 
+pub mod context;
+pub mod git;
 pub mod live;
 pub mod mcp;
 pub mod memory;
@@ -1096,6 +1098,23 @@ impl CodeIndex {
                 let r2 = sess.search_masked(&q2, cancel, Some(&allow)).map_err(|e| e.to_string())?;
                 raw.extend(r2.hits.iter().map(|h| (h.entry, h.score)));
             }
+        }
+        // The current project's own best matches, even if other repos crowd the top.
+        if let Some(root) = &rk.ctx_root
+            && let Some(i) = self.repos.iter().position(|r| r.path.as_os_str() == root.as_str())
+        {
+            let (a, b) = self.repos[i].range;
+            let mut m = vec![!0u64; mask.len()];
+            for e in a..b {
+                m[e as usize >> 6] &= !(1 << (e & 63));
+            }
+            for (x, y) in m.iter_mut().zip(&mask) {
+                *x |= y;
+            }
+            let mut q3 = q.clone();
+            q3.limit = limit.max(20);
+            let r3 = sess.search_masked(&q3, cancel, Some(&m)).map_err(|e| e.to_string())?;
+            raw.extend(r3.hits.iter().map(|h| (h.entry, h.score)));
         }
         raw.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         raw.dedup_by_key(|x| x.0);

@@ -21,6 +21,8 @@ USAGE (code projects):
         query adds repo:<name>  lang:<rust|ts|py|go|swift|...>  dirty:  and a file:LINE suffix to the syntax below
         --pick N        record result N as the file you meant and print its path (`cursor -g $(flashfind code --pick 1 q)`)
         --why           show scores and why personal ranking moved a result;  --baseline: 0.1 ranking
+        --cwd DIR|front current project for ranking (default: this shell's folder; front = frontmost app)
+  flashfind context [--pid P --bundle ID --title T]   which project the frontmost app is in
   flashfind pick <path>... [--query Q] [--action open|copy|reveal|cursor]   remember a pick (learned ranking)
   flashfind pick --show | --forget          inspect / clear the memory ($FLASHFIND_DATA or ~/.local/share/flashfind)
   flashfind mcp [--root DIR]... [--max-age SECS]      MCP server on stdio (find_files, list_projects, recent_files)
@@ -129,6 +131,7 @@ fn main() {
         "projects" => code::cmd_projects(a),
         "code" | "c" => code::cmd_code(a),
         "pick" => code::cmd_pick(a),
+        "context" => code::cmd_context(a),
         "mcp" => code::cmd_mcp(a),
         "gen-repos" => code::cmd_gen_repos(a),
         "bench-code" => code::cmd_bench_code(a),

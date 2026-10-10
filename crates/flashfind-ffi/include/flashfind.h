@@ -155,6 +155,12 @@ void ff_code_free(ff_code *c);
    (action: "open", "copy", "reveal", "cursor"). Stored in $FLASHFIND_DATA
    or ~/.local/share/flashfind/memory.jsonl, shared with the CLI and MCP. */
 int32_t ff_code_record_pick(const ff_code *c, const char *query, const char *path, const char *action);
+/* Current project context: files there (and its dirty / recently committed
+   files) rank higher. NULL clears. */
+void ff_code_session_set_cwd(ff_code_session *s, const char *cwd);
+/* Guess the frontmost app's project without extra permissions; title may be
+   NULL. Returns JSON {"root":..,"app":..,"how":..}; free with ff_string_free. */
+char *ff_code_detect_context(const ff_code *c, int32_t pid, const char *bundle_id, const char *title);
 ff_code_session *ff_code_session_new(const ff_code *c);
 void ff_code_session_free(ff_code_session *s);
 /* Query language + repo:/lang:/dirty:. Filters only => files newest first.

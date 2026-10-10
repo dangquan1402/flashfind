@@ -25,6 +25,7 @@
 
 use crate::util::Rng;
 use crate::{Args, die};
+use flashfind_code::git::GitInfo;
 use flashfind_code::{CodeIndex, CodeLive, CodeQuery, CodeSession, Config, Features, Memory, Ranker};
 use flashfind_core::CancelToken;
 use std::collections::HashMap;
@@ -46,6 +47,10 @@ pub struct Task {
     pub touches: Vec<(i64, String)>,
     /// Measured (false = warm-up only).
     pub measure: bool,
+    /// Current project when the task starts (where the previous task was).
+    pub ctx: Option<PathBuf>,
+    /// Git state of repos at task time (dirty files, recent commits).
+    pub git: Vec<(PathBuf, GitInfo)>,
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +79,13 @@ fn variants() -> Vec<Variant> {
     f.frecency = true;
     v.push(Variant {
         name: "+ file frecency, mild repo terms (F2)",
+        f,
+        empty_state: false,
+    });
+    f.context = true;
+    f.git = true;
+    v.push(Variant {
+        name: "+ current project, dirty, recent commits (F3)",
         f,
         empty_state: false,
     });
@@ -116,6 +128,12 @@ fn run_variant(live: &Arc<CodeLive>, tasks: &[Task], v: Variant, verbose: bool) 
     let mut sc = Score::default();
     for (ti, task) in tasks.iter().enumerate() {
         mem.set_clock(Some(task.t));
+        if let Some(r) = sess.ranker_mut() {
+            r.cwd = task.ctx.clone();
+            for (repo, g) in &task.git {
+                r.git.pin(repo, g.clone());
+            }
+        }
         let full = rank_of(&mut sess, &task.query, &task.path, DEPTH);
         // Keystrokes: cheapest prefix at which the file is visible.
         let chars: Vec<char> = task.query.chars().collect();
@@ -250,12 +268,39 @@ fn synthetic_tasks(world: &[(PathBuf, Vec<String>)], days: usize, per_day: usize
     }
     let mut tasks = Vec::new();
     let mut current = active[0];
+    let mut dirty: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut commits: HashMap<usize, Vec<Vec<String>>> = HashMap::new();
     for day in 0..days {
+        // End of the previous day: most repos with changes get a commit.
+        for &a in &active {
+            if let Some(d) = dirty.get_mut(&a)
+                && !d.is_empty()
+                && r.below(10) < 7
+            {
+                commits.entry(a).or_default().insert(0, std::mem::take(d));
+            }
+        }
         let main = active[zipf(r, active.len())];
         for j in 0..per_day {
             let t = t0 + (day as i64) * 86_400 + 9 * 3600 + (j as i64) * 900;
             let repo = if r.below(10) < 6 { main } else if r.below(10) < 5 { current } else { active[zipf(r, active.len())] };
+            let ctx = Some(canon[current].clone());
             current = repo;
+            let git: Vec<(PathBuf, GitInfo)> = active
+                .iter()
+                .map(|&a| {
+                    let mut g = GitInfo::default();
+                    for f in dirty.get(&a).into_iter().flatten() {
+                        g.dirty.insert(f.clone());
+                    }
+                    for (i, c) in commits.get(&a).into_iter().flatten().take(10).enumerate() {
+                        for f in c {
+                            g.recent.entry(f.clone()).or_insert(i);
+                        }
+                    }
+                    (canon[a].clone(), g)
+                })
+                .collect();
             let ws = working.get_mut(&repo).unwrap();
             // Slow drift of the working set.
             if r.below(40) == 0 {
@@ -277,6 +322,12 @@ fn synthetic_tasks(world: &[(PathBuf, Vec<String>)], days: usize, per_day: usize
                     touches.push((t + 300, canon[repo].join(o).to_string_lossy().into_owned()));
                 }
             }
+            for (_, p) in &touches {
+                let d = dirty.entry(repo).or_default();
+                if !d.contains(p) {
+                    d.push(p.clone());
+                }
+            }
             tasks.push(Task {
                 t,
                 path,
@@ -284,6 +335,8 @@ fn synthetic_tasks(world: &[(PathBuf, Vec<String>)], days: usize, per_day: usize
                 query: q,
                 touches,
                 measure: day >= 3,
+                ctx,
+                git,
             });
         }
     }
@@ -331,17 +384,44 @@ fn real_tasks(live: &Arc<CodeLive>, repos_n: usize, days: i64, max_tasks: usize)
         ev.drain(..ev.len() - max_tasks);
     }
     let n = ev.len();
-    ev.into_iter()
-        .enumerate()
-        .map(|(i, (t, repo, path))| Task {
+    // Recent-commit state per repo as of each task: files of the 10 newest
+    // commits strictly before it (dirty state is unknown: left empty).
+    let mut by_commit: HashMap<PathBuf, Vec<(i64, Vec<String>)>> = HashMap::new();
+    for (t, repo, path) in &ev {
+        let commit_t = *t; // files of one commit are 20 s apart
+        let v = by_commit.entry(repo.clone()).or_default();
+        match v.last_mut() {
+            Some((ct, files)) if (commit_t - *ct).abs() < 600 => files.push(path.clone()),
+            _ => v.push((commit_t, vec![path.clone()])),
+        }
+    }
+    let mut prev: Option<PathBuf> = None;
+    let mut out = Vec::new();
+    for (i, (t, repo, path)) in ev.into_iter().enumerate() {
+        let git = by_commit
+            .get(&repo)
+            .map(|cs| {
+                let mut g = GitInfo::default();
+                for (k, (_, files)) in cs.iter().rev().filter(|(ct, _)| *ct + 600 < t).take(10).enumerate() {
+                    for f in files {
+                        g.recent.entry(f.clone()).or_insert(k);
+                    }
+                }
+                vec![(repo.clone(), g)]
+            })
+            .unwrap_or_default();
+        out.push(Task {
             t: t.min(now),
             query: stem_query(&path),
             touches: vec![(t + 300, path.clone())],
             path,
-            repo,
+            repo: repo.clone(),
             measure: i >= n / 5,
-        })
-        .collect()
+            ctx: prev.replace(repo),
+            git,
+        });
+    }
+    out
 }
 
 pub fn cmd_bench_ux(mut a: Args) {

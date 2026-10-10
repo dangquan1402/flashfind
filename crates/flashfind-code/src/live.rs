@@ -684,6 +684,17 @@ impl CodeSession {
         self.ranker.as_ref()
     }
 
+    pub fn ranker_mut(&mut self) -> Option<&mut Ranker> {
+        self.ranker.as_mut()
+    }
+
+    /// Set the current folder / project for ranking (no-op without a ranker).
+    pub fn set_cwd(&mut self, cwd: Option<PathBuf>) {
+        if let Some(r) = self.ranker.as_mut() {
+            r.cwd = cwd;
+        }
+    }
+
     pub fn set_ranker(&mut self, r: Option<Ranker>) {
         self.ranker = r;
     }
@@ -743,7 +754,7 @@ impl CodeSession {
 
     pub fn search(&mut self, cq: &CodeQuery, cancel: &CancelToken) -> Result<CodeResult, String> {
         let rk = match &self.ranker {
-            Some(r) => r.input(&cq.text),
+            Some(r) => r.input(&cq.text, &self.live.repos()),
             None => RankInput::legacy(),
         };
         self.run(cq, &mut |ci, s, extra| ci.search_ranked(s, cq, cancel, extra, &rk))

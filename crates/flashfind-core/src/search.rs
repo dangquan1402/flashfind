@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Name ids per parallel work item.
-const NAME_CHUNK: usize = 16 * 1024;
+const NAME_CHUNK: usize = 4 * 1024;
 /// Entries per parallel work item in the entry phase (approx.).
 const ENTRY_CHUNK: usize = 32 * 1024;
 /// A token matched by an ancestor folder instead of the name is credited

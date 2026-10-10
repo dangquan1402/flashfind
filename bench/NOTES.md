@@ -2,3 +2,4 @@
 - Synthetic tree, warm metadata cache (a warm-up crawl runs first). Real disks have a different name distribution (more duplicate names, deeper system trees); treat these as engine comparisons, not whole-disk predictions.
 - `hit@1` uses flashfind's own generator, so read it as a sanity check rather than an independent quality benchmark. fsearch, by design, does not forgive a typo in the first character (`typo_first`) or a 4-letter-or-shorter typo.
 - `keys` replays typing each target name one character at a time in one search session; both engines narrow from the previous keystroke (fsearch via its name cache, flashfind via `Session`).
+- The machine was busy (load average shown under Machine; Spotlight and other user processes). Each engine ran twice, alternating, and the better run is reported; absolute numbers move between runs.

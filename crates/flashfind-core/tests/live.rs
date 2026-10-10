@@ -150,6 +150,7 @@ fn saved_event_id_and_compaction_persist() {
     touch(&root, "a/one.txt");
     let file = root.join("../flashfind-live-persist.ffx");
     let idx = build_from_disk(&root, &ScanOptions { threads: 2, skip: vec![] });
+    let id = idx.event_id + 4242;
     idx.save(&file).unwrap();
     let live = Live::open(&file, opts()).unwrap();
     touch(&root, "a/two_persisted.txt");
@@ -157,12 +158,12 @@ fn saved_event_id_and_compaction_persist() {
     live.apply_events(&[flashfind_core::watch::Event {
         path: b(&root.join("a")),
         flags: 0,
-        id: 4242,
+        id,
     }]);
     live.checkpoint();
     drop(live);
     let again = Live::open(&file, opts()).unwrap();
-    assert_eq!(again.progress().last_event_id, 4242);
+    assert_eq!(again.progress().last_event_id, id);
     let mut s = LiveSession::new(again.clone());
     assert_eq!(find(&mut s, "two_persisted"), vec!["a/two_persisted.txt"]);
     let _ = std::fs::remove_file(&file);

@@ -5,6 +5,8 @@
 #   bench/vs.sh linux        # shallow-clones torvalds/linux into $DATA and races on it
 #   bench/vs.sh chromium     # same for chromium/chromium (~500k files, several GB)
 #   bench/vs.sh repos        # synthetic 200-repo tree (node_modules, target, .venv ...)
+#   REPLICA=1 bench/vs.sh chromium   # name-search replica: exact tree + real .gitignores,
+#                                    # empty contents (bench/vs/replica.py; ~20 MB download)
 #
 # fff is fetched by cargo (pinned git rev of dmtrKovalenko/fff, its Rust core).
 # fsearch (macOS only) is used from ../fsearch next to this repo; cloned if missing.
@@ -33,11 +35,17 @@ fi
 case "$TARGET" in
   linux|chromium)
     URL=https://github.com/torvalds/linux.git; [ "$TARGET" = chromium ] && URL=https://github.com/chromium/chromium.git
-    if [ ! -d "$DATA/$TARGET/.git" ]; then
-      echo "shallow-cloning $URL into $DATA/$TARGET ..."
-      git clone -q --depth 1 "$URL" "$DATA/$TARGET"
+    NAME=$TARGET; [ "${REPLICA:-0}" = 1 ] && NAME=$TARGET-replica
+    if [ ! -d "$DATA/$NAME/.git" ]; then
+      if [ "${REPLICA:-0}" = 1 ]; then
+        python3 "$REPO/bench/vs/replica.py" clone "$URL" "$DATA/$NAME"
+      else
+        echo "shallow-cloning $URL into $DATA/$NAME ..."
+        git clone -q --depth 1 "$URL" "$DATA/$NAME"
+      fi
     fi
-    ROOT="$DATA/$TARGET"; LABEL=${LABEL:-$( [ "$TARGET" = linux ] && echo "Linux kernel" || echo Chromium )} ;;
+    ROOT="$DATA/$NAME"; LABEL=${LABEL:-$( [ "$TARGET" = linux ] && echo "Linux kernel" || echo Chromium )}
+    [ "${REPLICA:-0}" = 1 ] && LABEL="$LABEL (tree replica)" ;;
   repos)
     ROOT="$BENCH/repos-200-7.noindex"
     if [ ! -f "$ROOT.complete" ]; then

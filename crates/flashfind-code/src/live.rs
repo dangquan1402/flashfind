@@ -19,7 +19,7 @@
 //!   restart (or a one-shot CLI run, see [`CodeLive::replay`]) replays only
 //!   newer events.
 
-use crate::{CodeHit, CodeIndex, CodeQuery, CodeResult, Config, DISCOVERY_SKIP, RankInput, Ranker, Repo, git_dir, group, repo_info};
+use crate::{CodeHit, CodeIndex, CodeQuery, CodeResult, Config, DISCOVERY_SKIP, Memory, RankInput, Ranker, Repo, git_dir, group, repo_info};
 use flashfind_core::watch::{self, HISTORY_DONE, LOSSY};
 use flashfind_core::{CancelToken, Session};
 use std::collections::BTreeSet;
@@ -120,7 +120,17 @@ pub struct CodeLive {
     pub poll: Duration,
     /// FSEvents coalescing latency.
     pub latency: Duration,
+    /// Where file modifications seen by the watcher are recorded (frecency).
+    memory: Mutex<Option<Arc<Memory>>>,
+    touch_hooks: Mutex<Vec<TouchHook>>,
 }
+
+/// Called with the absolute path of every recorded modification.
+pub type TouchHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Files modified this recently when their folder's change event arrives
+/// count as edits (folder-level FSEvents carry no file names).
+const TOUCH_WINDOW: i64 = 120;
 
 fn hidden_or_skipped(name: &str, cfg: &Config) -> bool {
     name.starts_with('.')
@@ -158,7 +168,52 @@ impl CodeLive {
             compact_interval: Duration::from_secs(1800),
             poll: Duration::from_secs(300),
             latency: Duration::from_millis(30),
+            memory: Mutex::new(None),
+            touch_hooks: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Record file modifications the watcher sees into `m` (frecency).
+    pub fn set_memory(&self, m: Option<Arc<Memory>>) {
+        *self.memory.lock().unwrap() = m;
+    }
+
+    /// Get told about every recorded modification (e.g. the MCP server
+    /// turning "agent edited a file it just found" into a pick).
+    pub fn on_touch(&self, f: TouchHook) {
+        self.touch_hooks.lock().unwrap().push(f);
+    }
+
+    /// Recently modified files directly in `dir` → touches.
+    fn touches_in(&self, dir: &Path) {
+        let Some(m) = self.memory.lock().unwrap().clone() else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let now = crate::memory::now();
+        let snap = self.snapshot();
+        // Only files the index knows (not gitignored logs/build output).
+        let indexed = |p: &str| snap.base.idx.lookup(p.as_bytes()).is_some() || snap.overlays.iter().any(|o| o.idx.lookup(p.as_bytes()).is_some());
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if !md.is_file() {
+                continue;
+            }
+            let t = flashfind_core::walk::mtime_of(&md);
+            if now - t > TOUCH_WINDOW || t > now + 5 {
+                continue;
+            }
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            // Editor swap/backup files and lockfiles.
+            if n.starts_with(".#") || n.ends_with('~') || n.ends_with(".swp") || n.ends_with(".lock") || n == ".DS_Store" {
+                continue;
+            }
+            let p = e.path().to_string_lossy().into_owned();
+            if indexed(&p) && m.record_touch(&p) {
+                for h in self.touch_hooks.lock().unwrap().iter() {
+                    h(&p);
+                }
+            }
+        }
     }
 
     pub fn from_index(cfg: Config, base: CodeIndex) -> Arc<CodeLive> {
@@ -242,6 +297,9 @@ impl CodeLive {
                 } else if !lossy && comps.iter().any(|c| self.cfg.junk.iter().any(|j| j == c)) {
                     // node_modules churn and the like.
                 } else {
+                    if !lossy && flags & HISTORY_DONE == 0 {
+                        self.touches_in(p);
+                    }
                     rewalk.insert(repo);
                 }
                 continue;

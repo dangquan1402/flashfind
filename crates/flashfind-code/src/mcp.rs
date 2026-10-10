@@ -17,7 +17,14 @@ pub struct Server {
     live: Arc<CodeLive>,
     sess: Mutex<CodeSession>,
     memory: Option<Arc<Memory>>,
+    /// Recent find_files answers: (time, query, top paths). A file from one
+    /// of them that gets modified soon after is recorded as a pick for that
+    /// query (the agent found it and then edited it).
+    answers: Arc<Mutex<Vec<(i64, String, Vec<String>)>>>,
 }
+
+/// How long a find_files answer can turn a later edit into a pick.
+const IMPLICIT_PICK_WINDOW: i64 = 15 * 60;
 
 fn tools() -> Value {
     json!([
@@ -121,10 +128,25 @@ impl Server {
             Some(m) => CodeSession::with_ranker(live.clone(), Ranker::new(Some(m.clone()))),
             None => CodeSession::new(live.clone()),
         };
+        let answers: Arc<Mutex<Vec<(i64, String, Vec<String>)>>> = Arc::default();
+        if let Some(m) = &memory {
+            live.set_memory(Some(m.clone()));
+            let (m, a) = (m.clone(), answers.clone());
+            live.on_touch(Arc::new(move |p: &str| {
+                let now = crate::memory::now();
+                let mut a = a.lock().unwrap();
+                a.retain(|(t, _, _)| now - t < IMPLICIT_PICK_WINDOW);
+                if let Some((_, q, paths)) = a.iter_mut().rev().find(|(_, _, ps)| ps.iter().any(|x| x == p)) {
+                    paths.retain(|x| x != p);
+                    m.record_pick(q, p, "edit", "mcp");
+                }
+            }));
+        }
         Server {
             sess: Mutex::new(sess),
             live,
             memory,
+            answers,
         }
     }
 
@@ -157,6 +179,14 @@ impl Server {
                 let mut cq = CodeQuery::parse(&text);
                 cq.limit = limit(20);
                 let r = self.sess.lock().unwrap().search(&cq, &CancelToken::new())?;
+                if self.memory.is_some() && !cq.text.trim().is_empty() {
+                    let top: Vec<String> = r.hits.iter().take(10).map(|h| h.path.clone()).collect();
+                    let mut a = self.answers.lock().unwrap();
+                    a.push((crate::memory::now(), cq.text.clone(), top));
+                    if a.len() > 50 {
+                        a.remove(0);
+                    }
+                }
                 Ok(result_json(&r))
             }
             "list_projects" => Ok(projects_json(&self.live.repos(), s("filter").as_deref(), limit(50))),

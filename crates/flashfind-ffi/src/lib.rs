@@ -522,7 +522,10 @@ pub unsafe extern "C" fn ff_code_open(roots: *const c_char, cache_dir: *const c_
     if !live.just_built() {
         live.recheck();
     }
-    Box::into_raw(Box::new(FfCode(live, flashfind_code::Memory::open_default())))
+    let memory = flashfind_code::Memory::open_default();
+    // Edits the watcher sees feed per-file frecency.
+    live.set_memory(Some(memory.clone()));
+    Box::into_raw(Box::new(FfCode(live, memory)))
 }
 
 /// Follow file changes (FSEvents on macOS; periodic rebuilds elsewhere).

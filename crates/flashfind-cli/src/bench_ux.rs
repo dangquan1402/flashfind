@@ -70,6 +70,13 @@ fn variants() -> Vec<Variant> {
         f,
         empty_state: false,
     });
+    f.legacy_repo_recency = false;
+    f.frecency = true;
+    v.push(Variant {
+        name: "+ file frecency, mild repo terms (F2)",
+        f,
+        empty_state: false,
+    });
     v
 }
 

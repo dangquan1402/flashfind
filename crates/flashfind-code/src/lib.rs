@@ -1107,7 +1107,7 @@ impl CodeIndex {
                 if rk.features.legacy_repo_recency {
                     h.score += recency_boost(t - self.repos[h.repo].active);
                 }
-                let (pct, why) = rk.boost(&h.path);
+                let (pct, why) = rk.boost(&h);
                 h.score = rank::apply(h.score, pct);
                 h.why = why.join(", ");
                 h

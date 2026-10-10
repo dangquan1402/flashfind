@@ -125,3 +125,42 @@ fn weak_matches_cannot_ride_memory_past_strong_ones() {
     assert_eq!(rank::apply(545, 60.0), 872);
     let _ = std::fs::remove_dir_all(home);
 }
+
+#[test]
+fn watcher_edits_become_touches_and_frecency_ranks() {
+    let (home, live) = many("touch");
+    let m = Memory::in_memory();
+    live.set_memory(Some(m.clone()));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let s2 = seen.clone();
+    live.on_touch(std::sync::Arc::new(move |p: &str| s2.lock().unwrap().push(p.to_string())));
+    let dir = home.join("dev/repo19");
+    std::fs::write(dir.join("README.md"), "edited").unwrap();
+    live.apply(&[(dir.clone(), 0)]);
+    let want = dir.join("README.md").to_string_lossy().into_owned();
+    assert_eq!(seen.lock().unwrap().as_slice(), [want.clone()]);
+    assert_eq!(m.events().iter().filter(|e| e.k == "touch").count(), 1);
+    // Cooldown: the same edit burst is one touch.
+    live.apply(&[(dir.clone(), 0)]);
+    assert_eq!(m.events().iter().filter(|e| e.k == "touch").count(), 1);
+    // Frecency alone (no query memory) moves it to the top.
+    let mut f = Features::BASELINE;
+    f.legacy_repo_recency = false;
+    f.frecency = true;
+    let mut r = Ranker::new(Some(m.clone()));
+    r.features = f;
+    let mut sess = CodeSession::with_ranker(live.clone(), r);
+    assert_eq!(top(&mut sess, "readme")[0], want);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn frecency_decays_with_a_ten_day_half_life() {
+    let m = Memory::in_memory();
+    let t = memory::now();
+    m.set_clock(Some(t - 10 * 86_400));
+    m.record_pick("x", "/a", "open", "test");
+    m.set_clock(Some(t));
+    let f = m.recall().frecency["/a"];
+    assert!((f - 0.5).abs() < 0.01, "{f}");
+}

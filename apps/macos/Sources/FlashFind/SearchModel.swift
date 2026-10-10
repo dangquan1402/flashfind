@@ -18,7 +18,7 @@ struct Row: Identifiable {
 /// `file.rs:12[:3]` at the end of a query → (12, 3).
 func lineSuffix(_ q: String) -> (line: Int, col: Int?)? {
     guard let last = q.split(separator: " ").last,
-          let m = String(last).wholeMatch(of: /(.*[^:0-9].*):(\d+)(?::(\d+))?/),
+          let m = String(last).wholeMatch(of: /([^:]*[^:0-9][^:]*):(\d+)(?::(\d+))?/),
           let line = Int(m.2) else { return nil }
     return (line, m.3.flatMap { Int($0) })
 }

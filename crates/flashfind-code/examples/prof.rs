@@ -25,6 +25,21 @@ fn main() {
             ci
         }
     };
+    if std::env::var_os("MEM").is_some() {
+        let f = || flashfind_core::walk::footprint_mb();
+        eprintln!("footprint after build {:.1} MB", f());
+        flashfind_core::release_memory();
+        eprintln!("after release {:.1} MB", f());
+        let mut s = Session::new(ci.idx.clone());
+        let _ = ci.search(&mut s, &CodeQuery::parse("makefile"), &CancelToken::new());
+        eprintln!("after one search {:.1} MB", f());
+        drop(s);
+        let n = ci.idx.bytes();
+        drop(ci);
+        flashfind_core::release_memory();
+        eprintln!("after drop (index was {:.1} MB) {:.1} MB", n as f64 / 1048576.0, f());
+        return;
+    }
     eprintln!("index ready in {:?}: n={} u={} info={:?}", t.elapsed(), ci.idx.n, ci.idx.u, ci.info);
     let qs: Vec<(String, String)> = std::fs::read_to_string(&a[2]).unwrap().lines().map(|l| {
         let mut it = l.split('\t');

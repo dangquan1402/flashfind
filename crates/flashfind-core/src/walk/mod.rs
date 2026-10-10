@@ -172,3 +172,22 @@ pub(crate) fn join(parent: &[u8], name: &[u8]) -> Vec<u8> {
     p.extend_from_slice(name);
     p
 }
+
+/// This process's physical footprint in MB (macOS `ri_phys_footprint`,
+/// else resident set), for diagnostics.
+pub fn footprint_mb() -> f64 {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut info: libc::rusage_info_v2 = std::mem::zeroed();
+        if libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut info as *mut _ as *mut libc::rusage_info_t) == 0 {
+            return info.ri_phys_footprint as f64 / 1048576.0;
+        }
+        0.0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let pages: u64 = s.split_whitespace().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+        pages as f64 * 4096.0 / 1048576.0
+    }
+}

@@ -113,7 +113,7 @@ pub fn cmd_code(mut a: Args) {
             ci.recent(&cq, Some(secs))
         }
         None => {
-            if cq.text.trim().is_empty() && !cq.dirty && cq.langs.is_empty() {
+            if cq.text.trim().is_empty() && !cq.dirty && cq.langs.is_empty() && cq.repos.is_empty() {
                 die("code needs a query (or --recent 7d)");
             }
             let mut s = Session::new(ci.idx.clone());

@@ -132,6 +132,14 @@ fn repo_and_lang_filters_and_grouping() {
     assert_eq!(search(&ci, "lang:py repo:api-server models"), vec!["api-server:app/models.py"]);
     let mut s = Session::new(ci.idx.clone());
     assert!(ci.search(&mut s, &CodeQuery::parse("x repo:nope"), &CancelToken::new()).is_err());
+    let e = ci.search(&mut s, &CodeQuery::parse("x repo:engnie"), &CancelToken::new()).unwrap_err();
+    assert!(e.contains("closest: engine"), "{e}");
+    // Filters only: list the repo's files, newest first.
+    let all = search(&ci, "repo:engine");
+    assert!(
+        all.contains(&"engine:src/parser.rs".to_string()) && all.iter().all(|p| p.starts_with("engine:")),
+        "{all:?}"
+    );
     // Folder + name across repos.
     assert_eq!(search(&ci, "auth middleware")[0], "webapp:src/auth/middleware.ts");
     // Project folder itself is findable.

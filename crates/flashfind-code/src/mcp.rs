@@ -30,13 +30,13 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "e.g. \"auth middleware\", \"repo:api ext:ts router\", \"lang:rust parser\""},
+                    "query": {"type": "string", "description": "e.g. \"auth middleware\", \"repo:api ext:ts router\", \"lang:rust parser\". May be empty when repo/lang/dirty is given: then the matching files are listed newest first."},
                     "repo": {"type": "string", "description": "Restrict to projects whose name matches (exact, prefix or substring)."},
                     "lang": {"type": "string", "description": "Restrict to a language's file extensions."},
                     "dirty": {"type": "boolean", "description": "Only files with uncommitted changes (runs git status)."},
                     "limit": {"type": "integer", "description": "Max results (default 20, max 200)."}
                 },
-                "required": ["query"]
+                "required": []
             }
         },
         {
@@ -154,7 +154,10 @@ impl Server {
         match name {
             "find_files" => {
                 self.refresh();
-                let mut text = s("query").ok_or("query is required")?;
+                let mut text = s("query").unwrap_or_default();
+                if text.trim().is_empty() && s("repo").is_none() && s("lang").is_none() && a.get("dirty").is_none() {
+                    return Err("query is required (or give repo/lang/dirty to list files)".into());
+                }
                 if let Some(r) = s("repo") {
                     text.push_str(&format!(" repo:{r}"));
                 }

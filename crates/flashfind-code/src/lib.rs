@@ -638,6 +638,31 @@ impl CodeIndex {
         Vec::new()
     }
 
+    /// Project names closest to `want` (edit distance), for error messages.
+    pub fn similar_repos(&self, want: &str, k: usize) -> Vec<String> {
+        fn lev(a: &[u8], b: &[u8]) -> usize {
+            let mut prev: Vec<usize> = (0..=b.len()).collect();
+            for (i, &x) in a.iter().enumerate() {
+                let mut cur = vec![i + 1; b.len() + 1];
+                for (j, &y) in b.iter().enumerate() {
+                    cur[j + 1] = (prev[j] + (x != y) as usize).min(prev[j + 1] + 1).min(cur[j] + 1);
+                }
+                prev = cur;
+            }
+            prev[b.len()]
+        }
+        let w = want.to_ascii_lowercase();
+        let mut v: Vec<(usize, &str)> = self
+            .repos
+            .iter()
+            .map(|r| (lev(w.as_bytes(), r.name.to_ascii_lowercase().as_bytes()), r.name.as_str()))
+            .filter(|&(d, _)| d <= (w.len() / 2).max(2))
+            .collect();
+        v.sort();
+        v.dedup_by(|a, b| a.1 == b.1);
+        v.into_iter().take(k).map(|(_, n)| n.to_string()).collect()
+    }
+
     /// Entries with uncommitted changes in repo `i` (`git status`, cached 5 s).
     pub fn dirty_entries(&self, i: usize) -> Vec<u32> {
         if let Some((t, v)) = self.dirty.lock().unwrap().get(&i)
@@ -686,7 +711,12 @@ impl CodeIndex {
             for r in &cq.repos {
                 let m = self.match_repos(r);
                 if m.is_empty() {
-                    return Err(format!("no project matches repo:{r}"));
+                    let near = self.similar_repos(r, 5);
+                    return Err(if near.is_empty() {
+                        format!("no project matches repo:{r}")
+                    } else {
+                        format!("no project matches repo:{r} (closest: {})", near.join(", "))
+                    });
                 }
                 v.extend(m);
             }
@@ -737,6 +767,10 @@ impl CodeIndex {
 
     /// Search with code filters, recency boost and repo grouping.
     pub fn search(&self, sess: &mut Session, cq: &CodeQuery, cancel: &CancelToken) -> Result<CodeResult, String> {
+        // Only filters (e.g. `repo:x`, `dirty:`): list matching files, newest first.
+        if cq.text.trim().is_empty() {
+            return self.recent(cq, None);
+        }
         let t0 = Instant::now();
         let mut q = Query::parse(&cq.text)?;
         for l in &cq.langs {

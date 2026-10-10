@@ -363,7 +363,7 @@ pub fn run(o: &GenOpts) -> std::io::Result<()> {
     // (`bench/run.sh` drops a `.complete` marker next to the tree afterwards.)
 }
 
-fn typo(r: &mut Rng, s: &str, kind: &str) -> Option<String> {
+pub(crate) fn typo(r: &mut Rng, s: &str, kind: &str) -> Option<String> {
     let mut c: Vec<char> = s.chars().collect();
     let letters: Vec<usize> = (1..c.len()).filter(|&i| c[i].is_ascii_alphabetic()).collect();
     if letters.is_empty() {

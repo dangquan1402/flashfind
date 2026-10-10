@@ -923,6 +923,16 @@ impl Session {
         let idx = self.idx.clone();
         run(&idx, q, Some(&mut self.cache), cancel, true, None)
     }
+    /// Like [`Session::search`], but entries whose bit is set in `excluded`
+    /// (one bit per entry) are skipped. The narrowing cache stays valid
+    /// across different masks (it only holds name-level results).
+    pub fn search_masked(&mut self, q: &Query, cancel: &CancelToken, excluded: Option<&[u64]>) -> Result<SearchResult, Cancelled> {
+        let idx = self.idx.clone();
+        if let Some(m) = excluded {
+            assert!(m.len() * 64 >= idx.n, "mask too short");
+        }
+        run(&idx, q, Some(&mut self.cache), cancel, true, excluded)
+    }
     pub fn clear(&mut self) {
         self.cache.clear();
     }

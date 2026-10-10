@@ -1,6 +1,7 @@
 //! `flashfind` – index, search, benchmark.
 
 mod bench;
+mod code;
 mod report;
 mod treegen;
 mod util;
@@ -11,11 +12,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-const USAGE: &str = "flashfind – fast whole-disk file name search
+const USAGE: &str = "flashfind – find anything across all your code projects (and fast whole-disk file search)
 
-USAGE:
+USAGE (code projects):
+  flashfind projects [--root DIR]... [--json] [--refresh] [filter]
+  flashfind code [--root DIR]... [--json] [--flat] [--limit N] [--recent 7d] [--refresh] <query...>
+        query adds repo:<name>  lang:<rust|ts|py|go|swift|...>  dirty:  to the syntax below
+  flashfind mcp [--root DIR]... [--max-age SECS]      MCP server on stdio (find_files, list_projects, recent_files)
+  flashfind gen-repos --root DIR --repos N [--seed S] --queries FILE
+  flashfind bench-code --root DIR --queries FILE [--out JSON --md MD]
+  Roots default to $FLASHFIND_CODE_ROOTS or ~ (Library, media and hidden folders skipped);
+  the code index is cached in $FLASHFIND_CACHE or ~/.cache/flashfind (rebuilt when older than --max-age, default 600 s).
+
+USAGE (whole disk):
   flashfind index <root> [-o FILE] [--threads N] [--portable] [--skip PATH]... [--stats-json FILE]
   flashfind search [-i FILE] [--limit N] [--json] [--explain] <query...>
+  flashfind watch [<root>] [-i FILE] [--poll MS]   live index: crawl <root> (or open FILE), watch for
+        changes (FSEvents on macOS, polling elsewhere), answer one query per stdin line
   flashfind gen --root DIR --files N [--seed S] --queries FILE
   flashfind bench -i FILE --queries FILE [--repeat R] [--limit N] [--out FILE] [--label NAME]
   flashfind report --machine FILE --ff-build F --ff-query F [--fs-build F --fs-query F] --out FILE
@@ -103,6 +116,12 @@ fn main() {
             .unwrap_or_else(|e| die(e));
         }
         "bench" => bench::run(a),
+        "watch" => cmd_watch(a),
+        "projects" => code::cmd_projects(a),
+        "code" | "c" => code::cmd_code(a),
+        "mcp" => code::cmd_mcp(a),
+        "gen-repos" => code::cmd_gen_repos(a),
+        "bench-code" => code::cmd_bench_code(a),
         "report" => report::run(a),
         "help" | "-h" | "--help" => {
             if a.rest().first().map(String::as_str) == Some("query") {
@@ -164,6 +183,63 @@ fn cmd_index(mut a: Args) {
 }
 
 const KINDS: [&str; 4] = ["file", "dir", "link", "other"];
+
+fn cmd_watch(mut a: Args) {
+    use flashfind_core::{Live, LiveOptions, LiveSession};
+    use std::io::BufRead;
+    let file = a.opt(&["-i", "--index"]).map(PathBuf::from).unwrap_or_else(default_index);
+    let limit = a.num(&["--limit", "-n"], 10usize);
+    let mut opts = LiveOptions::default();
+    if let Some(ms) = a.opt(&["--poll"]) {
+        opts.poll = std::time::Duration::from_millis(ms.parse().unwrap_or_else(|_| die("bad --poll")));
+        opts.force_poll = true;
+    }
+    let rest = a.rest();
+    let live = match rest.first() {
+        Some(root) => Live::crawl(std::path::Path::new(root), Some(file), opts),
+        None => Live::open(&file, opts).unwrap_or_else(|e| die(format!("{}: {e}", file.display()))),
+    };
+    live.watch().unwrap_or_else(|e| die(e));
+    let mut s = LiveSession::new(live.clone());
+    let show = |live: &Live| {
+        let p = live.progress();
+        let phase = ["crawling", "building", "ready"][p.phase.min(2) as usize];
+        eprintln!(
+            "[{phase}] {} entries, overlay {}, removed {}, compactions {}, last event {}",
+            p.entries, p.overlay, p.dead, p.compactions, p.last_event_id
+        );
+    };
+    show(&live);
+    eprintln!("type a query per line (empty line: status, Ctrl-D: quit)");
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            show(&live);
+            continue;
+        }
+        let mut q = match Query::parse(&line) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("{e}");
+                continue;
+            }
+        };
+        q.limit = limit;
+        let t = Instant::now();
+        let r = s.search(&q, &CancelToken::new()).unwrap();
+        for h in &r.hits {
+            println!("{}", h.path_str());
+        }
+        eprintln!(
+            "{} matches in {:.2?}{}",
+            r.total,
+            t.elapsed(),
+            if r.partial { " (partial: still crawling)" } else { "" }
+        );
+    }
+    live.checkpoint();
+    live.unwatch();
+}
 
 fn cmd_search(mut a: Args) {
     let file = a.opt(&["-i", "--index"]).map(PathBuf::from).unwrap_or_else(default_index);

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 flashfind-core = { path = "../flashfind-core" }
+flashfind-code = { path = "../flashfind-code" }
 rayon = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }

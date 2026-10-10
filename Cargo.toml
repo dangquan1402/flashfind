@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/flashfind-core", "crates/flashfind-cli", "crates/flashfind-ffi"]
+members = ["crates/flashfind-core", "crates/flashfind-code", "crates/flashfind-cli", "crates/flashfind-ffi"]
 exclude = ["bench/fsearch-baseline"]
 
 [workspace.package]

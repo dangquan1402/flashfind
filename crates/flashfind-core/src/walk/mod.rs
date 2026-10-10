@@ -52,7 +52,7 @@ impl Listing {
         &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize]
     }
 
-    pub(crate) fn push(&mut self, name: &[u8], kind: u8, size: u64, mtime: i64) -> Option<usize> {
+    pub fn push(&mut self, name: &[u8], kind: u8, size: u64, mtime: i64) -> Option<usize> {
         if name.is_empty() || name.len() > u16::MAX as usize {
             return None;
         }

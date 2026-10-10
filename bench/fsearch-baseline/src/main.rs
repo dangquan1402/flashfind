@@ -100,7 +100,7 @@ fn main() {
                 }
             }
             let mut classes = serde_json::Map::new();
-            let mut all = Vec::new();
+            let mut all: Vec<f64> = Vec::new();
             for (c, mut v) in lat {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 all.extend(&v);

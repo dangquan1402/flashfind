@@ -220,7 +220,7 @@ impl Engine {
                 let f = tmp.join("fsearch.idx");
                 live.base.save(&f).ok()?;
                 let t = Instant::now();
-                let idx = fsearch::index::Index::load(&f).ok()?;
+                let idx = fsearch::index::Index::load(&f)?;
                 let mut e = Engine::Fsearch {
                     live: fsearch::live::Live::new(idx),
                     home: home.clone(),
@@ -238,7 +238,7 @@ pub fn footprint_bytes() -> u64 {
     #[cfg(target_os = "macos")]
     unsafe {
         let mut info: libc::rusage_info_v2 = std::mem::zeroed();
-        if libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut info as *mut _ as *mut libc::c_void) == 0 {
+        if libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut info as *mut _ as *mut libc::rusage_info_t) == 0 {
             return info.ri_phys_footprint;
         }
         0

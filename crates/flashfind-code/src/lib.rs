@@ -669,13 +669,23 @@ impl CodeIndex {
         }
         drop(tx);
         drop(btx);
+        let timing = std::env::var_os("FLASHFIND_TIMING").is_some();
+        let fp = |what: &str| {
+            if timing {
+                eprintln!("  footprint {what}: {:.1} MB", flashfind_core::walk::footprint_mb());
+            }
+        };
+        fp("before collect");
         let mut ents: Vec<Ent> = rx.into_iter().flatten().collect();
         let bulk: Vec<(Vec<u8>, Listing)> = brx.into_iter().flatten().collect();
+        fp("after walk");
         fill_attrs(&mut ents, &bulk);
         drop(bulk);
+        fp("after fill_attrs + drop bulk");
         let crawl_ms = t1.elapsed().as_secs_f64() * 1e3;
         let t2 = Instant::now();
         let ls = listings(&root, ents);
+        fp("after listings");
         let t_ls = t2.elapsed();
         let refs: Vec<&Listing> = ls.iter().collect();
         let idx = Index::build_refs(&refs, &root, now(), 0);
@@ -683,7 +693,9 @@ impl CodeIndex {
             eprintln!("listings {:?}, index build {:?}", t_ls, t2.elapsed() - t_ls);
         }
         drop(refs);
+        fp("after index build");
         drop(ls);
+        fp("after drop listings");
         let build_ms = t2.elapsed().as_secs_f64() * 1e3;
         let info = BuildInfo {
             repos: repos.len(),

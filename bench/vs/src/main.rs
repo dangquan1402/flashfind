@@ -229,13 +229,12 @@ impl Ctx {
         vec![
             String::new(),
             format!(
-                "  {BOLD}{}{title}{RESET}  {}{} · {} files · {} · {} · load {:.1}{RESET}",
+                "  {BOLD}{}{title}{RESET}  {}{} · {} files · {} · load {:.1}{RESET}",
                 white(),
                 grey(),
                 self.label,
                 thousands(self.files),
-                self.mach,
-                self.os,
+                self.mach.split(" (").next().unwrap_or(&self.mach),
                 l[0]
             ),
             String::new(),
@@ -731,12 +730,12 @@ fn race_frame(
     };
     let aggs: Vec<Stat> = cx.kinds.iter().map(|&k| agg(k)).collect();
     let p50s: Vec<f64> = aggs.iter().map(|s| pct(&s.us, 50.0)).collect();
-    let best = p50s.iter().cloned().fold(f64::INFINITY, f64::min);
+    let best_i = (0..p50s.len()).min_by(|&a, &b| p50s[a].partial_cmp(&p50s[b]).unwrap_or(std::cmp::Ordering::Equal));
     for (lab, f) in [("median", 50.0), ("p95", 95.0)] {
         let mut s = format!("  {}{}{RESET} {}", grey(), pad(lab, 34), pad("", 7));
         for (i, st) in aggs.iter().enumerate() {
             let v = pct(&st.us, f);
-            let c = if f == 50.0 && p50s[i] == best {
+            let c = if f == 50.0 && Some(i) == best_i && aggs.len() > 1 {
                 format!("{BOLD}{}", green())
             } else {
                 white()
@@ -754,9 +753,9 @@ fn race_frame(
         ));
     }
     l.push(s);
-    let mut s = format!("  {}{}{RESET} {}", grey(), pad("latency, last 24 queries", 34), pad("", 7));
+    let mut s = format!("  {}{}{RESET} {}", grey(), pad("latency, last 9 queries", 34), pad("", 7));
     for (i, st) in aggs.iter().enumerate() {
-        s.push_str(&format!("  {}{}{RESET} ", color_of(cx.kinds[i]), pad(&spark(&st.us, 24), 24)));
+        s.push_str(&format!("  {}{}{RESET}  ", color_of(cx.kinds[i]), rpad(&spark(&st.us, 9), 9)));
     }
     l.push(s);
     cx.t.frame(&l);

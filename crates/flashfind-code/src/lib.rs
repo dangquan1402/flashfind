@@ -1062,8 +1062,12 @@ impl CodeIndex {
 
     /// Search with personal ranking (see [`rank`]).
     pub fn search_ranked(&self, sess: &mut Session, cq: &CodeQuery, cancel: &CancelToken, extra: Option<&[u64]>, rk: &RankInput) -> Result<CodeResult, String> {
-        // Only filters (e.g. `repo:x`, `dirty:`): list matching files, newest first.
         if cq.text.trim().is_empty() {
+            // Nothing typed and no filters: what you probably want next.
+            if cq.repos.is_empty() && cq.langs.is_empty() && !cq.dirty && rk.personal() {
+                return self.suggest(cq, extra, rk);
+            }
+            // Only filters (e.g. `repo:x`, `dirty:`): list matching files, newest first.
             return self.recent_with(cq, None, extra);
         }
         let t0 = Instant::now();
@@ -1138,6 +1142,54 @@ impl CodeIndex {
         Ok(CodeResult {
             hits,
             total: r.total,
+            elapsed_us: t0.elapsed().as_micros() as u64,
+            groups,
+        })
+    }
+
+    /// The empty state: frecent / recently picked files, the current
+    /// project's uncommitted, recently committed and just-modified files,
+    /// ranked by the same personal boosts (on a flat base score).
+    pub fn suggest(&self, cq: &CodeQuery, extra: Option<&[u64]>, rk: &RankInput) -> Result<CodeResult, String> {
+        let t0 = Instant::now();
+        let mask = self.mask(cq, extra)?;
+        let alive = |e: u32| (mask[e as usize >> 6] >> (e & 63)) & 1 == 0 && self.idx.ent_kind()[e as usize] & KIND_MASK == KIND_FILE;
+        let mut ents: Vec<u32> = rk.suggestions().iter().filter_map(|p| self.idx.lookup(p.as_bytes())).filter(|&e| alive(e)).collect();
+        // Just-modified files of the current project.
+        if let Some(root) = &rk.ctx_root
+            && self.repos.iter().any(|r| r.path.as_os_str() == root.as_str())
+        {
+            let i = self.repos.iter().position(|r| r.path.as_os_str() == root.as_str()).unwrap();
+            let (a, b) = self.repos[i].range;
+            let mut newest: Vec<(i64, u32)> = (a..b).filter(|&e| alive(e)).map(|e| (self.idx.mtime(e), e)).collect();
+            newest.sort_unstable_by(|x, y| y.cmp(x));
+            ents.extend(newest.into_iter().take(15).map(|(_, e)| e));
+        }
+        ents.sort_unstable();
+        ents.dedup();
+        let now = rk.now;
+        let mut hits: Vec<CodeHit> = ents
+            .iter()
+            .filter_map(|&e| self.hit(e, 1000))
+            .map(|mut h| {
+                let (mut pct, mut why) = rk.boost(&h);
+                let age = now - h.mtime;
+                if rk.ctx_root.as_deref() == Some(h.repo_root.as_str()) && (0..86_400).contains(&age) {
+                    pct += if age < 3600 { 10.0 } else { 5.0 };
+                    why.push("modified");
+                }
+                h.score = rank::apply(1000, pct);
+                h.why = why.join(", ");
+                h
+            })
+            .collect();
+        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.mtime.cmp(&a.mtime)).then_with(|| a.path.cmp(&b.path)));
+        let total = hits.len() as u64;
+        hits.truncate(cq.limit.max(1));
+        let groups = group(&hits);
+        Ok(CodeResult {
+            hits,
+            total,
             elapsed_us: t0.elapsed().as_micros() as u64,
             groups,
         })

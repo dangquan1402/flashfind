@@ -199,6 +199,28 @@ impl RankInput {
         }
     }
 
+    /// Whether any personal signal is on (else the empty state stays empty).
+    pub fn personal(&self) -> bool {
+        let f = self.features;
+        f.memory || f.frecency || f.context || f.git
+    }
+
+    /// Candidates for the empty state (nothing typed yet): frecent and
+    /// recently picked files plus the current project's dirty / recently
+    /// committed files.
+    pub fn suggestions(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.frecent.iter().map(String::as_str).collect();
+        if let Some(r) = &self.recall {
+            let mut picks: Vec<(&String, &(u32, i64))> = r.picks.iter().collect();
+            picks.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+            v.extend(picks.into_iter().take(50).map(|(p, _)| p.as_str()));
+        }
+        v.extend(self.ctx_files.iter().map(String::as_str));
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     /// Paths worth scoring even if the matcher wouldn't fetch them.
     pub fn candidates(&self) -> Vec<&str> {
         let mut v: Vec<&str> = self.qmem.keys().map(String::as_str).collect();

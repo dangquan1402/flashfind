@@ -229,3 +229,31 @@ fn real_git_status_and_log() {
     assert!(g.is_dirty(&b) && !g.is_dirty(&a));
     let _ = std::fs::remove_dir_all(d);
 }
+
+#[test]
+fn empty_query_suggests_what_you_were_working_on() {
+    let (home, live) = many("empty");
+    let m = Memory::in_memory();
+    let mut r = Ranker::new(Some(m.clone()));
+    let root = home.join("dev/repo08");
+    let mut g = git::GitInfo::default();
+    let dirty = root.join("src/reporter.ts").to_string_lossy().into_owned();
+    g.dirty.insert(dirty.clone());
+    r.git.pin(&root, g);
+    r.cwd = Some(root.clone());
+    let picked = home.join("dev/repo02/README.md").to_string_lossy().into_owned();
+    for _ in 0..3 {
+        m.record_pick("readme", &picked, "open", "test");
+    }
+    let mut sess = CodeSession::with_ranker(live.clone(), r);
+    let mut cq = CodeQuery::parse("");
+    cq.limit = 10;
+    let res = sess.search(&cq, &flashfind_core::CancelToken::new()).unwrap();
+    let paths: Vec<&str> = res.hits.iter().map(|h| h.path.as_str()).collect();
+    assert!(paths.contains(&dirty.as_str()) && paths.contains(&picked.as_str()), "{paths:?}");
+    assert!(res.hits.iter().all(|h| h.kind == "file"));
+    // Legacy sessions keep the old behaviour (empty page via filters only).
+    let mut legacy = CodeSession::new(live.clone());
+    assert!(legacy.search(&cq, &flashfind_core::CancelToken::new()).unwrap().hits.len() <= 10);
+    let _ = std::fs::remove_dir_all(home);
+}

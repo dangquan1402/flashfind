@@ -12,6 +12,15 @@ struct Row: Identifiable {
     let subtitle: String
     let hitIndex: Int?
     let isDir: Bool
+    var why: String = ""
+}
+
+/// `file.rs:12[:3]` at the end of a query → (12, 3).
+func lineSuffix(_ q: String) -> (line: Int, col: Int?)? {
+    guard let last = q.split(separator: " ").last,
+          let m = String(last).wholeMatch(of: /(.*[^:0-9].*):(\d+)(?::(\d+))?/),
+          let line = Int(m.2) else { return nil }
+    return (line, m.3.flatMap { Int($0) })
 }
 
 struct LaunchOptions {
@@ -61,6 +70,10 @@ final class SearchModel: ObservableObject {
     @Published private(set) var hits: [Hit] = []
     @Published private(set) var rows: [Row] = []
     @Published var selected = 0
+    /// Hits marked with Tab (multi-select for copy / open).
+    @Published var marked = Set<Int>()
+    /// The list shows suggestions (nothing typed yet).
+    @Published private(set) var suggesting = false
     @Published private(set) var status = "Loading projects…"
     @Published private(set) var hint: String?
     @Published private(set) var ready = false
@@ -173,7 +186,7 @@ final class SearchModel: ObservableObject {
             hint = "Whole-disk mode needs an index at \(abbreviate(diskIndexPath)).\nBuild one with:  flashfind index / -o ~/.flashfind/index.ffx\n(the terminal needs Full Disk Access for a complete crawl)."
             return
         }
-        if q.isEmpty {
+        if q.isEmpty && mode == .disk {
             hits = []
             rows = []
             status = idle
@@ -187,7 +200,7 @@ final class SearchModel: ObservableObject {
         let disk = self.disk
         let t0 = DispatchTime.now().uptimeNanoseconds
         queue.async {
-            let r: SearchResult? = mode == .code ? code?.search(q, limit: 80, cancel: tok) : disk?.search(q, limit: 80, cancel: tok)
+            let r: SearchResult? = mode == .code ? code?.search(q, limit: q.isEmpty ? 30 : 80, cancel: tok) : disk?.search(q, limit: 80, cancel: tok)
             DispatchQueue.main.async {
                 // Each token is freed exactly once, after its own search returned.
                 if self.current == tok { self.current = nil }
@@ -209,6 +222,7 @@ final class SearchModel: ObservableObject {
             return
         }
         hits = r.hits
+        suggesting = mode == .code && query.trimmingCharacters(in: .whitespaces).isEmpty
         var rows: [Row] = []
         var lastGroup = -1
         for (i, h) in r.hits.enumerated() {
@@ -216,10 +230,16 @@ final class SearchModel: ObservableObject {
                 lastGroup = h.group
                 rows.append(Row(id: -1 - h.group, header: true, title: h.repo, subtitle: "\(abbreviate(h.repoRoot)) · \(ago(h.repoActive))", hitIndex: nil, isDir: true))
             }
-            rows.append(Row(id: i, header: false, title: h.rel, subtitle: "", hitIndex: i, isDir: h.isDir))
+            rows.append(Row(id: i, header: false, title: h.rel, subtitle: "", hitIndex: i, isDir: h.isDir, why: h.why))
         }
         self.rows = rows
         selected = 0
+        marked = []
+        if suggesting {
+            status = r.hits.isEmpty ? idle : "Suggested: recent, frequent and uncommitted files · type to search · " + brief
+            onResults?()
+            return
+        }
         let engine = Double(r.engineMicros) / 1000
         let shown = r.total > UInt64(r.hits.count) ? "\(r.hits.count) of \(r.total.formatted())" : "\(r.hits.count)"
         if Date() > flashUntil {
@@ -229,6 +249,18 @@ final class SearchModel: ObservableObject {
     }
 
     var selectedHit: Hit? { hits.indices.contains(selected) ? hits[selected] : nil }
+
+    /// Marked hits (Tab), else the selected one.
+    var targets: [Hit] {
+        let m = marked.sorted().compactMap { hits.indices.contains($0) ? hits[$0] : nil }
+        return m.isEmpty ? (selectedHit.map { [$0] } ?? []) : m
+    }
+
+    func toggleMark() {
+        guard selectedHit != nil else { return }
+        if marked.contains(selected) { marked.remove(selected) } else { marked.insert(selected) }
+        move(1)
+    }
 
     func move(_ d: Int) {
         guard !hits.isEmpty else { return }
@@ -248,15 +280,17 @@ final class SearchModel: ObservableObject {
     }
 
     func open() {
-        guard let h = selectedHit else { return }
-        learn(h, "open")
-        NSWorkspace.shared.open(URL(fileURLWithPath: h.path))
+        for h in targets {
+            learn(h, "open")
+            NSWorkspace.shared.open(URL(fileURLWithPath: h.path))
+        }
     }
 
     func reveal() {
-        guard let h = selectedHit else { return }
-        learn(h, "reveal")
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: h.path)])
+        let t = targets
+        guard !t.isEmpty else { return }
+        for h in t { learn(h, "reveal") }
+        NSWorkspace.shared.activateFileViewerSelecting(t.map { URL(fileURLWithPath: $0.path) })
     }
 
     static func cursorApp() -> URL? {
@@ -267,23 +301,57 @@ final class SearchModel: ObservableObject {
         return nil
     }
 
-    func openInCursor() {
-        guard let h = selectedHit else { return }
-        guard let app = SearchModel.cursorApp() else {
-            flash("Cursor is not installed")
-            return
-        }
-        learn(h, "cursor")
-        var urls = [URL(fileURLWithPath: h.path)]
-        if mode == .code && !h.repoRoot.isEmpty { urls.insert(URL(fileURLWithPath: h.repoRoot), at: 0) }
-        NSWorkspace.shared.open(urls, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+    static func vscodeApp() -> URL? {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.microsoft.VSCode")
     }
 
-    func copyPath() {
-        guard let h = selectedHit else { return }
-        learn(h, "copy")
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(h.path, forType: .string)
-        flash("Copied \(abbreviate(h.path))")
+    /// ⌥↩: open in Cursor (VS Code as a fallback), at `file:LINE[:COL]` when
+    /// the query ends with one. The repo folder opens as the workspace.
+    func openInCursor() {
+        let at = lineSuffix(query)
+        let cursor = SearchModel.cursorApp()
+        let editor = cursor ?? SearchModel.vscodeApp()
+        guard let editor else {
+            flash("Cursor (or VS Code) is not installed: opening with the default app")
+            open()
+            return
+        }
+        let scheme = cursor != nil ? "cursor" : "vscode"
+        for h in targets {
+            learn(h, "cursor")
+            var urls = [URL(fileURLWithPath: h.path)]
+            if mode == .code && !h.repoRoot.isEmpty { urls.insert(URL(fileURLWithPath: h.repoRoot), at: 0) }
+            NSWorkspace.shared.open(urls, withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
+            if let at, !h.isDir {
+                // cursor://file/<abs path>:<line>:<col> jumps to the line (VS Code URL handler).
+                let enc = h.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? h.path
+                if let u = URL(string: "\(scheme)://file\(enc):\(at.line):\(at.col ?? 1)") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { NSWorkspace.shared.open(u) }
+                }
+            }
+        }
     }
+
+    enum CopyKind { case absolute, relative, mention }
+
+    /// ⌘C absolute paths · ⌘⇧C repo-relative · ⌥⌘C `@path` mentions for
+    /// agent chats (Cursor / Claude Code), of the marked rows or the selected one.
+    func copy(_ kind: CopyKind) {
+        let t = targets
+        guard !t.isEmpty else { return }
+        let rel = { (h: Hit) in mode == .code && !h.rel.isEmpty ? h.rel : abbreviate(h.path) }
+        let text: String
+        switch kind {
+        case .absolute: text = t.map(\.path).joined(separator: "\n")
+        case .relative: text = t.map(rel).joined(separator: "\n")
+        case .mention: text = t.map { "@" + rel($0) }.joined(separator: " ")
+        }
+        for h in t { learn(h, "copy") }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        let what = t.count == 1 ? (kind == .absolute ? abbreviate(t[0].path) : text) : "\(t.count) paths"
+        flash("Copied \(what)")
+    }
+
+    func copyPath() { copy(.absolute) }
 }

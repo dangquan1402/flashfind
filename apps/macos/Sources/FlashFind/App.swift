@@ -190,8 +190,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case kVK_Return, kVK_ANSI_KeypadEnter:
             if mods.contains(.command) { model.reveal() } else if mods.contains(.option) { model.openInCursor() } else { model.open() }
             return nil
+        case kVK_Tab where mods.isEmpty && model.selectedHit != nil:
+            model.toggleMark(); lastWasNav = true; return nil
         case kVK_Escape:
             if quickLookVisible { QLPreviewPanel.shared().orderOut(nil); return nil }
+            if !model.marked.isEmpty { model.marked = []; return nil }
             if model.query.isEmpty { window.orderOut(nil) } else { model.query = "" }
             return nil
         case kVK_Space where mods.isEmpty && (lastWasNav || quickLookVisible) && model.selectedHit != nil:
@@ -199,7 +202,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case kVK_ANSI_Y where mods == .command:
             toggleQuickLook(); return nil
         case kVK_ANSI_C where mods == .command && !textIsSelected() && model.selectedHit != nil:
-            model.copyPath(); return nil
+            model.copy(.absolute); return nil
+        case kVK_ANSI_C where mods == [.command, .shift] && model.selectedHit != nil:
+            model.copy(.relative); return nil
+        case kVK_ANSI_C where mods == [.command, .option] && model.selectedHit != nil:
+            model.copy(.mention); return nil
         case kVK_ANSI_1 where mods == .command:
             model.mode = .code; return nil
         case kVK_ANSI_2 where mods == .command:

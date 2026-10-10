@@ -22,6 +22,7 @@ USAGE (code projects):
         --pick N        record result N as the file you meant and print its path (`cursor -g $(flashfind code --pick 1 q)`)
         --why           show scores and why personal ranking moved a result;  --baseline: 0.1 ranking
         --cwd DIR|front current project for ranking (default: this shell's folder; front = frontmost app)
+        no query        suggestions: frequent / recently picked files, this project's uncommitted and recent ones
   flashfind context [--pid P --bundle ID --title T]   which project the frontmost app is in
   flashfind pick <path>... [--query Q] [--action open|copy|reveal|cursor]   remember a pick (learned ranking)
   flashfind pick --show | --forget          inspect / clear the memory ($FLASHFIND_DATA or ~/.local/share/flashfind)

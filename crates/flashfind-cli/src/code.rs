@@ -162,9 +162,10 @@ pub fn cmd_code(mut a: Args) {
             sess.recent(&cq, Some(secs))
         }
         None => {
-            if cq.text.trim().is_empty() && !cq.dirty && cq.langs.is_empty() && cq.repos.is_empty() {
+            if cq.text.trim().is_empty() && !cq.dirty && cq.langs.is_empty() && cq.repos.is_empty() && baseline {
                 die("code needs a query (or --recent 7d)");
             }
+            // No query: suggestions (frequent, picked, this project's dirty / recent files).
             sess.search(&cq, &CancelToken::new())
         }
     }

@@ -163,8 +163,10 @@ void ff_code_session_set_cwd(ff_code_session *s, const char *cwd);
 char *ff_code_detect_context(const ff_code *c, int32_t pid, const char *bundle_id, const char *title);
 ff_code_session *ff_code_session_new(const ff_code *c);
 void ff_code_session_free(ff_code_session *s);
-/* Query language + repo:/lang:/dirty:. Filters only => files newest first.
-   An empty query delivers an empty page. */
+/* Query language + repo:/lang:/dirty:, optional file:LINE suffix. Filters
+   only => files newest first. An empty query delivers suggestions: frequent
+   and recently picked files, the current project's uncommitted, recently
+   committed and just-modified files (hit.why says which). */
 int32_t ff_code_search(ff_code_session *s, const char *query, uint32_t limit, const ff_cancel *cancel,
                        ff_code_page_cb cb, void *ctx, char **err);
 

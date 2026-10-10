@@ -35,7 +35,7 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                         .padding(30)
                 } else if model.rows.isEmpty {
-                    Text(model.query.isEmpty ? (model.ready ? "Type to search every git repo under your home folder.\nTry  Cargo.toml   repo:flashfind readme   lang:swift view" : "Opening the project index…") : "No matches")
+                    Text(model.query.isEmpty ? (model.ready ? "Type to search every git repo under your home folder.\nTry  Cargo.toml   repo:flashfind readme   lang:swift view   main.rs:42\nFiles you open, edit and commit show up here next time." : "Opening the project index…") : "No matches")
                         .multilineTextAlignment(.center)
                         .foregroundStyle(.secondary)
                 } else {
@@ -52,9 +52,9 @@ struct ContentView: View {
                 }
                 Text(model.status).monospacedDigit().lineLimit(1).truncationMode(.tail).layoutPriority(1)
                 Spacer(minLength: 8)
-                Text("↩ open · ⌘↩ reveal · ⌥↩ Cursor · ⌘Y preview · ⌘C copy")
+                Text(model.marked.isEmpty ? "↩ open · ⌥↩ Cursor · ⌘↩ reveal · ⌘C path · ⌘⇧C rel · ⌥⌘C @path · ⇥ mark" : "\(model.marked.count) marked · ⌘C / ⌘⇧C / ⌥⌘C copy all · ↩ open all · esc unmark")
                     .lineLimit(1)
-                    .help("Space also previews after moving with ↑/↓. Esc clears, then hides. ⌘1/⌘2 switch mode. ⌃⌥Space toggles from anywhere.")
+                    .help("⌥↩ opens in Cursor at file:LINE when the query ends with :LINE. ⇥ marks rows for multi-copy. ⌘Y or Space (after ↑/↓) previews. Esc clears, then hides. ⌘1/⌘2 switch mode. ⌃⌥Space toggles from anywhere.")
             }
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
@@ -70,8 +70,18 @@ struct ContentView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    if model.suggesting {
+                        HStack(spacing: 6) {
+                            Image(systemName: "sparkles").foregroundStyle(.yellow)
+                            Text(model.contextName.map { "Suggested · working in \($0)" } ?? "Suggested · recent and frequent files")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("type to search everything").font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 6)
+                    }
                     ForEach(model.rows) { row in
-                        RowView(row: row, selected: row.hitIndex == model.selected)
+                        RowView(row: row, selected: row.hitIndex == model.selected, marked: row.hitIndex.map { model.marked.contains($0) } ?? false)
                             .id(row.id)
                             .contentShape(Rectangle())
                             .onTapGesture(count: 2) {
@@ -96,6 +106,7 @@ struct ContentView: View {
 struct RowView: View {
     let row: Row
     let selected: Bool
+    var marked = false
 
     var body: some View {
         if row.header {
@@ -111,12 +122,21 @@ struct RowView: View {
             let name = (row.title as NSString).lastPathComponent
             let dir = (row.title as NSString).deletingLastPathComponent
             HStack(spacing: 8) {
-                Image(systemName: row.isDir ? "folder" : "doc.text")
+                Image(systemName: marked ? "checkmark.circle.fill" : (row.isDir ? "folder" : "doc.text"))
                     .frame(width: 16)
-                    .foregroundStyle(selected ? .white : .secondary)
+                    .foregroundStyle(selected ? .white : (marked ? Color.accentColor : .secondary))
                 Text(name).font(.system(size: 13, weight: .medium)).lineLimit(1)
                 Text(dir).font(.system(size: 12)).foregroundStyle(selected ? .white.opacity(0.8) : .secondary).lineLimit(1).truncationMode(.head)
                 Spacer(minLength: 0)
+                if !row.why.isEmpty {
+                    Text(row.why)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(selected ? .white.opacity(0.9) : .secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(selected ? Color.white.opacity(0.18) : Color.secondary.opacity(0.12)))
+                        .lineLimit(1)
+                }
             }
             .foregroundStyle(selected ? .white : .primary)
             .padding(.horizontal, 10)

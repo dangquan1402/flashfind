@@ -678,11 +678,9 @@ pub unsafe extern "C" fn ff_code_search(
         if token.is_cancelled() {
             return FF_CANCELLED;
         }
-        if cq.text.trim().is_empty() && cq.repos.is_empty() && cq.langs.is_empty() && !cq.dirty {
-            Ok(flashfind_code::CodeResult::default())
-        } else {
-            g.search(&cq, &token)
-        }
+        // An empty query gives the ranked empty state (recent, frequent,
+        // uncommitted files of the current project).
+        g.search(&cq, &token)
     };
     let res = match res {
         Ok(r) => r,

@@ -18,7 +18,7 @@ fn main() {
     let ci = match cache.as_ref().and_then(|c| CodeIndex::load(c).ok()) {
         Some(ci) => ci,
         None => {
-            let ci = CodeIndex::build(&Config { roots: vec![root.clone()], ..Config::default() });
+            let ci = CodeIndex::build(&Config { roots: vec![root.clone()], gitignore: std::env::var_os("NOGI").is_none(), ..Config::default() });
             if let Some(c) = &cache {
                 ci.save(c).unwrap();
             }

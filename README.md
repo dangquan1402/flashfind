@@ -57,6 +57,9 @@ flashfind stands on two MIT-licensed projects. Full license texts are in
   by Andrew Gallant (MIT/Unlicense, the walker behind ripgrep) for
   `.gitignore` semantics.
 
+
+The terminal benchmark (`bench/vs`) is modeled on fsearch's `demo/vs_fff.py` / `vs_fff_demo.py` (same query method and visual style). It links fff's `fff-search` crate and fsearch's library, both unmodified, only in that separately built harness.
+
 ## Code projects
 
 ```sh
@@ -329,6 +332,67 @@ It delivers hits grouped by repo (`path`, `rel`, `repo`, `repo_root`,
 `group`, `repo_active`, …). Also `ff_code_projects_json`, `ff_code_get_stats`
 and `ff_code_checkpoint`.
 
+## Benchmark vs fff and fsearch
+
+![flashfind vs fff vs fsearch on the Chromium tree](docs/bench-vs-chromium.png)
+
+`flashfind bench-vs` is a live terminal race modeled on
+[fsearch's benchmark vs fff](https://github.com/noahdunnagan/fsearch/tree/main/demo).
+fsearch's method: `demo/vs_fff.py` picks 300 unique names plus 4 typos each,
+and `demo/vs_fff_demo.py` + `vs_fff.tape` record the side-by-side video.
+flashfind, fff (its Rust core, `fff-search`) and fsearch (its library) run in
+one process, on the same folder and queries, warm, taking turns going first.
+The race shows each query live, with the winner's time in green, a ✓/✗ for
+"right file first" and flashfind's speedup (or loss) against the best other
+engine. Then it shows an animated summary card and a p50/p95/p99 table.
+
+```sh
+bench/vs.sh repos                 # synthetic 200-repo tree (node_modules, target, .venv…)
+bench/vs.sh linux                 # shallow clone of torvalds/linux
+bench/vs.sh chromium              # shallow clone of chromium/chromium (several GB)
+REPLICA=1 bench/vs.sh chromium    # tree replica: exact paths + real .gitignores, empty files (~20 MB download)
+bench/vs.sh ~/some/folder "label" -- --cast run.cast --md out.md --json out.json
+python3 bench/vs/render.py run.cast out.png [--marker race] [--mp4 out.mp4]   # pip install pyte pillow
+```
+
+`bench/vs.sh` builds `bench/vs` (cargo fetches fff at a pinned rev; fsearch
+is used from `../fsearch` and cloned there if missing). It installs nothing
+system-wide. fsearch is macOS-only, so on Linux the race is flashfind vs fff.
+
+Median latency (Apple M5 Pro, macOS 26.5.1, **heavily loaded machine**, see
+[bench/VS_RESULTS.md](bench/VS_RESULTS.md) for p95/p99 and method):
+
+| dataset | query | flashfind | fff | fsearch |
+|---|---|---|---|---|
+| Chromium tree, 507k files | exact name | 3.3 ms | 35 ms | **1.1 ms** |
+| | with a typo | 2.9 ms | 34 ms | **1.0 ms** |
+| | per keystroke | **0.25 ms** | 32 ms | 0.96 ms |
+| | typo → right file first | 95% | 86% | **98%** |
+| | ready cold / memory | 4.9 s / 204 MB | 4.8 s / 209 MB | **1.5 s / 126 MB** |
+| Linux tree, 96k files | exact / typo | 0.25 / 0.25 ms | 1.9 / 1.8 ms | **0.19 / 0.18 ms** |
+| | per keystroke | **0.12 ms** | 1.8 ms | 0.22 ms |
+| 200 repos + junk, 48k files | exact / typo | **0.14 / 0.12 ms** | 1.9 / 1.7 ms | 0.34 / 0.30 ms |
+| | per keystroke | **0.19 ms** | 2.2 ms | 0.57 ms |
+| | junk in top 10 | **0%** | 5% | 29–43% |
+| | `repo:` queries | **0.16 ms, 100% first** | – | – |
+
+Where flashfind loses:
+- **fsearch is about 3× faster per one-shot name query on one big repo**, and
+  also builds its index about 3× faster with about 40% less memory there.
+  flashfind's code engine pays for repo mapping and project-aware ranking on
+  every query.
+- **fff starts slightly faster and uses a little less memory** on the
+  multi-repo tree.
+- **Typo top-1 on Chromium is 95%**, behind fsearch's 98%.
+
+Where flashfind wins:
+- **Typing**: incremental narrowing makes each keystroke cheaper than a fresh
+  search.
+- **Many repos at once**: gitignore-aware, no junk, `repo:` filters.
+- **fff in every latency row** (about 10×).
+
+![race view](docs/bench-vs-race.png)
+
 ## FlashFind.app (macOS demo)
 
 A launcher-style SwiftUI + AppKit app (macOS 15+) in `apps/macos`. It links
@@ -385,6 +449,7 @@ cargo test --release --workspace
 - `crates/flashfind-ffi`: C ABI
 - `apps/macos`: FlashFind.app (SwiftPM; `scripts/build-app.sh`)
 - `bench/`: run scripts, fsearch baseline harness, results
+- `bench/vs`: `flashfind bench-vs` terminal race vs fff and fsearch (links both, built separately), `replica.py`, `render.py`
 
 ## Roadmap
 

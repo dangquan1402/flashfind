@@ -243,6 +243,16 @@ pub fn discover(cfg: &Config) -> Vec<Repo> {
 }
 
 #[cfg(unix)]
+fn bytes_to_path(b: &[u8]) -> &Path {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(b))
+}
+#[cfg(not(unix))]
+fn bytes_to_path(b: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(b).into_owned())
+}
+
+#[cfg(unix)]
 fn path_into_bytes(p: PathBuf) -> Vec<u8> {
     use std::os::unix::ffi::OsStringExt;
     p.into_os_string().into_vec()
@@ -283,6 +293,43 @@ struct Ent {
     kind: u8,
     size: u64,
     mtime: i64,
+}
+
+/// Children of a listing sorted by name (the order the index keeps).
+fn sort_listing(l: &mut Listing) {
+    let names = &l.names;
+    l.ents
+        .sort_by(|a, b| names[a.name_off as usize..a.name_off as usize + a.name_len as usize].cmp(&names[b.name_off as usize..b.name_off as usize + b.name_len as usize]));
+}
+
+/// Give entries without attributes (`mtime == i64::MIN`) the size and mtime
+/// from their folder's bulk listing (sorted by name), else from lstat.
+fn fill_attrs(ents: &mut [Ent], bulk: &[(Vec<u8>, Listing)]) {
+    use rayon::prelude::*;
+    if bulk.is_empty() && ents.iter().all(|e| e.mtime != i64::MIN) {
+        return;
+    }
+    let mut by_dir: ByteMap<&Listing> = ByteMap::default();
+    by_dir.reserve(bulk.len());
+    for (p, l) in bulk {
+        by_dir.insert(p, l);
+    }
+    ents.par_iter_mut().with_min_len(4096).for_each(|e| {
+        if e.mtime != i64::MIN {
+            return;
+        }
+        let hit = split_path(&e.path).and_then(|(parent, name)| {
+            let l = by_dir.get(parent)?;
+            let i = l.ents.binary_search_by(|r| l.name(r).cmp(name)).ok()?;
+            let r = &l.ents[i];
+            Some((r.size, r.mtime))
+        });
+        let (size, mt) = hit.unwrap_or_else(|| {
+            std::fs::symlink_metadata(bytes_to_path(&e.path)).map_or((0, 0), |m| (m.len(), flashfind_core::walk::mtime_of(&m)))
+        });
+        e.size = if e.kind == KIND_FILE { size } else { 0 };
+        e.mtime = mt;
+    });
 }
 
 type ByteMap<'a, V> = HashMap<&'a [u8], V, std::hash::BuildHasherDefault<flashfind_core::index::Fx>>;
@@ -341,10 +388,7 @@ fn listings(root: &Path, mut ents: Vec<Ent>) -> Vec<Listing> {
     drop(ids);
     drop(dir_mtime);
     for l in &mut ls {
-        let names = &l.names;
-        l.ents.sort_by(|a, b| {
-            names[a.name_off as usize..a.name_off as usize + a.name_len as usize].cmp(&names[b.name_off as usize..b.name_off as usize + b.name_len as usize])
-        });
+        sort_listing(l);
     }
     ls
 }
@@ -546,6 +590,7 @@ impl CodeIndex {
         let paths: Vec<PathBuf> = repos.iter().map(|r| r.path.clone()).collect();
         let root = root.to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel::<Vec<Ent>>();
+        let (btx, brx) = std::sync::mpsc::channel::<Vec<(Vec<u8>, Listing)>>();
         if let Some((first, rest)) = paths.split_first() {
             let mut wb = ignore::WalkBuilder::new(first);
             for p in rest {
@@ -568,20 +613,25 @@ impl CodeIndex {
                     let n = e.file_name().to_string_lossy();
                     !(junk.iter().any(|j| *j == n) && e.file_type().is_some_and(|t| t.is_dir()) || n == ".git" || n == ".DS_Store")
                 });
+            // On macOS, sizes and mtimes come from one getattrlistbulk call
+            // per accepted directory instead of an lstat per entry; the
+            // walker still decides what is included (gitignore semantics).
+            let bulk_attrs = cfg!(target_os = "macos");
+            let btx = btx.clone();
             wb.build_parallel().run(|| {
                 let tx = tx.clone();
-                let mut buf: Vec<Ent> = Vec::with_capacity(4096);
-                struct Flush(std::sync::mpsc::Sender<Vec<Ent>>, Vec<Ent>);
+                let btx = btx.clone();
+                struct Flush(std::sync::mpsc::Sender<Vec<Ent>>, Vec<Ent>, std::sync::mpsc::Sender<Vec<(Vec<u8>, Listing)>>, Vec<(Vec<u8>, Listing)>);
                 impl Drop for Flush {
                     fn drop(&mut self) {
                         let _ = self.0.send(std::mem::take(&mut self.1));
+                        let _ = self.2.send(std::mem::take(&mut self.3));
                     }
                 }
-                let mut f = Flush(tx, std::mem::take(&mut buf));
+                let mut f = Flush(tx, Vec::with_capacity(4096), btx, Vec::new());
                 Box::new(move |r| {
                     let Ok(e) = r else { return ignore::WalkState::Continue };
                     let Some(ft) = e.file_type() else { return ignore::WalkState::Continue };
-                    let md = e.metadata().ok();
                     let kind = if ft.is_symlink() {
                         KIND_LINK
                     } else if ft.is_dir() {
@@ -591,7 +641,19 @@ impl CodeIndex {
                     } else {
                         KIND_OTHER
                     };
-                    let (size, mt) = md.map_or((0, 0), |m| (if kind == KIND_FILE { m.len() } else { 0 }, flashfind_core::walk::mtime_of(&m)));
+                    let (size, mt) = if bulk_attrs {
+                        (0, i64::MIN)
+                    } else {
+                        let md = e.metadata().ok();
+                        md.map_or((0, 0), |m| (if kind == KIND_FILE { m.len() } else { 0 }, flashfind_core::walk::mtime_of(&m)))
+                    };
+                    if bulk_attrs
+                        && kind == KIND_DIR
+                        && let Some(mut l) = flashfind_core::walk::list_dir(e.path())
+                    {
+                        sort_listing(&mut l);
+                        f.3.push((pbytes(e.path()), l));
+                    }
                     f.1.push(Ent {
                         path: path_into_bytes(e.into_path()),
                         kind,
@@ -606,7 +668,11 @@ impl CodeIndex {
             });
         }
         drop(tx);
-        let ents: Vec<Ent> = rx.into_iter().flatten().collect();
+        drop(btx);
+        let mut ents: Vec<Ent> = rx.into_iter().flatten().collect();
+        let bulk: Vec<(Vec<u8>, Listing)> = brx.into_iter().flatten().collect();
+        fill_attrs(&mut ents, &bulk);
+        drop(bulk);
         let crawl_ms = t1.elapsed().as_secs_f64() * 1e3;
         let t2 = Instant::now();
         let ls = listings(&root, ents);

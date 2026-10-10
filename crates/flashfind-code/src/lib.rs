@@ -16,7 +16,7 @@ pub mod mcp;
 
 pub use live::{CodeLive, CodeSession, LiveStats};
 
-use flashfind_core::walk::{KIND_DIR, KIND_FILE, KIND_LINK, KIND_MASK, KIND_OTHER, Listing, NONE};
+use flashfind_core::walk::{KIND_DIR, KIND_FILE, KIND_LINK, KIND_MASK, KIND_OTHER, Listing};
 use flashfind_core::{CancelToken, Index, Query, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -243,6 +243,16 @@ pub fn discover(cfg: &Config) -> Vec<Repo> {
 }
 
 #[cfg(unix)]
+fn path_into_bytes(p: PathBuf) -> Vec<u8> {
+    use std::os::unix::ffi::OsStringExt;
+    p.into_os_string().into_vec()
+}
+#[cfg(not(unix))]
+fn path_into_bytes(p: PathBuf) -> Vec<u8> {
+    p.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(unix)]
 fn pbytes(p: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     p.as_os_str().as_bytes().to_vec()
@@ -268,49 +278,74 @@ fn common_root(paths: &[PathBuf]) -> PathBuf {
 }
 
 struct Ent {
-    path: PathBuf,
+    /// Absolute path bytes.
+    path: Vec<u8>,
     kind: u8,
     size: u64,
     mtime: i64,
 }
 
-/// Stitch walker entries into crawler listings below `root`.
+type ByteMap<'a, V> = HashMap<&'a [u8], V, std::hash::BuildHasherDefault<flashfind_core::index::Fx>>;
+
+/// (parent, name) of an absolute byte path; `None` for "/" or no slash.
+fn split_path(p: &[u8]) -> Option<(&[u8], &[u8])> {
+    let i = memchr::memrchr(b'/', p)?;
+    let name = &p[i + 1..];
+    if name.is_empty() {
+        return None;
+    }
+    Some((if i == 0 { &p[..1] } else { &p[..i] }, name))
+}
+
+/// Stitch walker entries into crawler listings below `root`. Works on raw
+/// path bytes (memcmp sort, byte-slice hash map); each listing's children
+/// end up sorted by name, the order `Index::build_refs` keeps.
 fn listings(root: &Path, mut ents: Vec<Ent>) -> Vec<Listing> {
+    let rootb = pbytes(root);
+    let under = |p: &[u8]| p.len() > rootb.len() && p.starts_with(&rootb) && (rootb.ends_with(b"/") || p[rootb.len()] == b'/');
     ents.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    let dir_mtime: HashMap<&Path, i64> = ents
-        .iter()
-        .filter(|e| e.kind & KIND_MASK == KIND_DIR)
-        .map(|e| (e.path.as_path(), e.mtime))
-        .collect();
+    let mut dir_mtime: ByteMap<i64> = ByteMap::default();
+    for e in &ents {
+        if e.kind & KIND_MASK == KIND_DIR {
+            dir_mtime.insert(&e.path, e.mtime);
+        }
+    }
     let mut ls: Vec<Listing> = vec![Listing::default()];
-    let mut ids: HashMap<PathBuf, u32> = HashMap::new();
-    ids.insert(root.to_path_buf(), 0);
-    fn ensure(dir: &Path, root: &Path, ls: &mut Vec<Listing>, ids: &mut HashMap<PathBuf, u32>, mt: &HashMap<&Path, i64>) -> Option<u32> {
+    let mut ids: ByteMap<u32> = ByteMap::default();
+    ids.insert(&rootb, 0);
+    fn ensure<'a>(dir: &'a [u8], under: &dyn Fn(&[u8]) -> bool, ls: &mut Vec<Listing>, ids: &mut ByteMap<'a, u32>, mt: &ByteMap<i64>) -> Option<u32> {
         if let Some(&i) = ids.get(dir) {
             return Some(i);
         }
-        if !dir.starts_with(root) || dir == root {
+        if !under(dir) {
             return None;
         }
-        let parent = ensure(dir.parent()?, root, ls, ids, mt)?;
+        let (parent, name) = split_path(dir)?;
+        let pid = ensure(parent, under, ls, ids, mt)?;
         let id = ls.len() as u32;
         ls.push(Listing { id, ..Default::default() });
-        let name = pbytes(Path::new(dir.file_name()?));
-        let i = ls[parent as usize].push(&name, KIND_DIR, 0, mt.get(dir).copied().unwrap_or(0))?;
-        ls[parent as usize].ents[i].child = id;
-        ids.insert(dir.to_path_buf(), id);
+        let i = ls[pid as usize].push(name, KIND_DIR, 0, mt.get(dir).copied().unwrap_or(0))?;
+        ls[pid as usize].ents[i].child = id;
+        ids.insert(dir, id);
         Some(id)
     }
     for e in &ents {
         if e.kind & KIND_MASK == KIND_DIR {
-            ensure(&e.path, root, &mut ls, &mut ids, &dir_mtime);
-        } else if let (Some(parent), Some(name)) = (e.path.parent(), e.path.file_name())
-            && let Some(pid) = ensure(parent, root, &mut ls, &mut ids, &dir_mtime)
+            ensure(&e.path, &under, &mut ls, &mut ids, &dir_mtime);
+        } else if let Some((parent, name)) = split_path(&e.path)
+            && let Some(pid) = ensure(parent, &under, &mut ls, &mut ids, &dir_mtime)
         {
-            ls[pid as usize].push(&pbytes(Path::new(name)), e.kind, e.size, e.mtime);
+            ls[pid as usize].push(name, e.kind, e.size, e.mtime);
         }
     }
-    let _ = NONE;
+    drop(ids);
+    drop(dir_mtime);
+    for l in &mut ls {
+        let names = &l.names;
+        l.ents.sort_by(|a, b| {
+            names[a.name_off as usize..a.name_off as usize + a.name_len as usize].cmp(&names[b.name_off as usize..b.name_off as usize + b.name_len as usize])
+        });
+    }
     ls
 }
 
@@ -558,7 +593,7 @@ impl CodeIndex {
                     };
                     let (size, mt) = md.map_or((0, 0), |m| (if kind == KIND_FILE { m.len() } else { 0 }, flashfind_core::walk::mtime_of(&m)));
                     f.1.push(Ent {
-                        path: e.into_path(),
+                        path: path_into_bytes(e.into_path()),
                         kind,
                         size,
                         mtime: mt,
@@ -575,8 +610,12 @@ impl CodeIndex {
         let crawl_ms = t1.elapsed().as_secs_f64() * 1e3;
         let t2 = Instant::now();
         let ls = listings(&root, ents);
+        let t_ls = t2.elapsed();
         let refs: Vec<&Listing> = ls.iter().collect();
         let idx = Index::build_refs(&refs, &root, now(), 0);
+        if std::env::var_os("FLASHFIND_TIMING").is_some() {
+            eprintln!("listings {:?}, index build {:?}", t_ls, t2.elapsed() - t_ls);
+        }
         drop(refs);
         drop(ls);
         let build_ms = t2.elapsed().as_secs_f64() * 1e3;
@@ -759,7 +798,7 @@ impl CodeIndex {
         self.repos[i].range
     }
 
-    fn mask(&self, cq: &CodeQuery, extra: Option<&[u64]>) -> Result<Vec<u64>, String> {
+    pub fn mask(&self, cq: &CodeQuery, extra: Option<&[u64]>) -> Result<Vec<u64>, String> {
         let mut mask = self.outside.clone();
         if let Some(x) = extra {
             for (m, e) in mask.iter_mut().zip(x) {

@@ -310,6 +310,23 @@ impl Ctx<'_> {
                                 n += 1;
                             }
                         }
+                        [(need, 0)] => {
+                            for (i, &m) in masks[lo..hi].iter().enumerate() {
+                                cand[n] = (lo + i) as u32;
+                                n += may_match(*need, 0, m) as usize;
+                            }
+                        }
+                        [(need, k)] if self.toks[0].mode == crate::query::Mode::Fuzzy => {
+                            // A fuzzy name with typos survives cleanly (every
+                            // class present) or as a typo candidate, which
+                            // needs its bigram signature to pass too.
+                            let pat = &self.toks[0].pat;
+                            let sigs = self.idx.name_sig();
+                            for (i, (&m, &sg)) in masks[lo..hi].iter().zip(&sigs[lo..hi]).enumerate() {
+                                cand[n] = (lo + i) as u32;
+                                n += (may_match(*need, 0, m) | (may_match(*need, *k, m) && pat.sig_ok(sg))) as usize;
+                            }
+                        }
                         [(need, k)] => {
                             for (i, &m) in masks[lo..hi].iter().enumerate() {
                                 cand[n] = (lo + i) as u32;
@@ -592,7 +609,7 @@ pub(crate) fn score_tokens(toks: &[Token], lower: &[u8], orig: &[u8], sig: crate
         if toks.len() > 1 && !may_match(t.pat.mask, k, mask) {
             continue;
         }
-        if let Some(s) = t.score_opt(lower, orig, sig, typos) {
+        if let Some(s) = t.score_m(lower, orig, sig, mask, typos) {
             score += s;
             bits |= 1 << i;
             if i < TS {

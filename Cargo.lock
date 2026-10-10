@@ -70,6 +70,7 @@ version = "0.1.0"
 dependencies = [
  "flashfind-core",
  "ignore",
+ "memchr",
  "rayon",
  "serde",
  "serde_json",

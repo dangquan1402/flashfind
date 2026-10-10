@@ -121,7 +121,7 @@ pub struct BuildStats {
 }
 
 #[derive(Default)]
-pub(crate) struct Fx(u64);
+pub struct Fx(u64);
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
         self.0

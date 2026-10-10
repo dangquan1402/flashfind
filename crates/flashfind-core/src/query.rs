@@ -52,10 +52,17 @@ impl Token {
     /// `typos = false` scores clean (non-typo) matches only.
     #[inline]
     pub fn score_opt(&self, name: &[u8], orig: &[u8], sig: crate::matcher::Sig, typos: bool) -> Option<i32> {
+        self.score_m(name, orig, sig, !0, typos)
+    }
+
+    /// `score_opt` given the name's class mask (or a superset; `!0` = unknown).
+    #[inline]
+    pub fn score_m(&self, name: &[u8], orig: &[u8], sig: crate::matcher::Sig, m: u64, typos: bool) -> Option<i32> {
         use crate::matcher::*;
         let t = &self.pat.text[..];
         match self.mode {
-            Mode::Fuzzy if typos => self.pat.score_sig(name, orig, sig),
+            Mode::Fuzzy if typos => self.pat.score_masked(name, orig, sig, m),
+            Mode::Fuzzy if self.pat.mask & !m != 0 => None,
             Mode::Fuzzy => self.pat.clean_score(name, orig),
             Mode::Exact => (name == t).then_some(EXACT),
             Mode::Prefix => {

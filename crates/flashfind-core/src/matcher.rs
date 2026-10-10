@@ -80,7 +80,16 @@ pub fn typo_budget(len: usize) -> u8 {
 /// of the token's classes from the required set.
 #[inline(always)]
 pub fn may_match(need: u64, k: u8, m: u64) -> bool {
-    (need & !m).count_ones() <= k as u32
+    let x = need & !m;
+    match k {
+        0 => x == 0,
+        1 => x & x.wrapping_sub(1) == 0,
+        2 => {
+            let y = x & x.wrapping_sub(1);
+            y & y.wrapping_sub(1) == 0
+        }
+        _ => x.count_ones() <= k as u32,
+    }
 }
 
 pub const EXACT: i32 = 1000;
@@ -144,6 +153,25 @@ pub struct Pattern {
     /// least one piece survives verbatim (an edit touches ≤ 2 pieces), so a
     /// candidate name must contain all bigrams of some piece.
     pieces: Vec<Sig>,
+    /// The same pieces as byte strings: a name passing a piece's signature
+    /// test must also contain that piece verbatim (the signature is a hashed
+    /// 64-bit set and saturates on long names).
+    piece_finders: Vec<memchr::memmem::Finder<'static>>,
+    /// q-gram filter (q = `gram_q`, 0 = off): a name within `typos` OSA
+    /// edits of the token has at least `gram_min` byte positions whose q-gram
+    /// is one of the token's (each edit destroys at most q+1 of the token's
+    /// m−q+1 q-grams; surviving ones sit at distinct name positions). The
+    /// set is a 1024-bit hash, so collisions only make the test looser.
+    gram_q: u8,
+    gram_min: u32,
+    gram_set: Option<Box<[u64; 512]>>,
+}
+
+/// q-gram slot: 5 low bits per folded byte (15 bits for trigrams). Bytes
+/// sharing low bits collide, which only loosens the filter.
+#[inline(always)]
+fn gram_slot(w: &[u8]) -> usize {
+    w.iter().fold(0usize, |h, &b| (h << 5) | (b & 31) as usize)
 }
 
 impl Pattern {
@@ -159,13 +187,33 @@ impl Pattern {
         let bigrams = bigram_sig(folded);
         let min_bigrams = bigrams.count_ones().saturating_sub(3 * typos as u32);
         let np = 2 * typos as usize + 1;
-        let pieces = if typos > 0 && folded.len() >= 2 * np {
-            (0..np)
-                .map(|i| bigram_sig(&folded[i * folded.len() / np..(i + 1) * folded.len() / np]))
-                .collect()
+        let piece_bytes: Vec<&[u8]> = if typos > 0 && folded.len() >= 2 * np {
+            (0..np).map(|i| &folded[i * folded.len() / np..(i + 1) * folded.len() / np]).collect()
         } else {
             Vec::new()
         };
+        let pieces = piece_bytes.iter().map(|p| bigram_sig(p)).collect();
+        let piece_finders = piece_bytes.iter().map(|p| memchr::memmem::Finder::new(p).into_owned()).collect();
+        let (mut gram_q, mut gram_min, mut gram_set) = (0u8, 0u32, None);
+        if typos > 0 {
+            let m = folded.len() as i64;
+            let k = typos as i64;
+            // Prefer trigrams (more selective) when they still leave a bound.
+            for q in [3i64, 2] {
+                let need = (m - q + 1) - k * (q + 1);
+                if need > 0 {
+                    gram_q = q as u8;
+                    gram_min = need as u32;
+                    let mut set = Box::new([0u64; 512]);
+                    for w in folded.windows(q as usize) {
+                        let h = gram_slot(w);
+                        set[h >> 6] |= 1 << (h & 63);
+                    }
+                    gram_set = Some(set);
+                    break;
+                }
+            }
+        }
         Pattern {
             text: folded.to_vec(),
             mask: class_mask(folded),
@@ -175,6 +223,10 @@ impl Pattern {
             bigrams,
             min_bigrams,
             pieces,
+            piece_finders,
+            gram_q,
+            gram_min,
+            gram_set,
         }
     }
 
@@ -189,6 +241,49 @@ impl Pattern {
         self.typos > 0
             && (self.bigrams & name_bigrams).count_ones() >= self.min_bigrams
             && (self.pieces.is_empty() || self.pieces.iter().any(|&p| p & name_bigrams == p))
+    }
+
+    /// `typo_candidate` plus the exact form of the piece test: some piece
+    /// occurs verbatim in `name` (k OSA edits touch at most 2k of the 2k+1
+    /// pieces, so this never rejects a name within budget).
+    #[inline(always)]
+    pub fn typo_candidate_in(&self, name: &[u8], name_bigrams: Sig) -> bool {
+        self.typos > 0
+            && (self.bigrams & name_bigrams).count_ones() >= self.min_bigrams
+            && (self.pieces.is_empty() || self.pieces.iter().any(|&p| p & name_bigrams == p))
+            && self.grams_ok(name)
+            && (self.pieces.is_empty() || self.pieces.iter().zip(&self.piece_finders).any(|(&p, f)| p & name_bigrams == p && f.find(name).is_some()))
+    }
+
+    /// Signature-only part of `typo_candidate_in` (no name bytes needed), for
+    /// the gather loop.
+    #[inline(always)]
+    pub fn sig_ok(&self, name_bigrams: Sig) -> bool {
+        self.typos > 0
+            && (self.bigrams & name_bigrams).count_ones() >= self.min_bigrams
+            && (self.pieces.is_empty() || self.pieces.iter().any(|&p| p & name_bigrams == p))
+    }
+
+    /// The q-gram count test (see `gram_q`).
+    #[inline(always)]
+    fn grams_ok(&self, name: &[u8]) -> bool {
+        let Some(set) = self.gram_set.as_deref() else {
+            return true;
+        };
+        let q = self.gram_q as usize;
+        if name.len() < q {
+            return false;
+        }
+        let need = self.gram_min;
+        let mut n = 0u32;
+        // Rolling slot: keep the last q bytes' 5-bit codes.
+        let keep = (1usize << (5 * q)) - 1;
+        let mut h = gram_slot(&name[..q - 1]);
+        for &b in &name[q - 1..] {
+            h = ((h << 5) | (b & 31) as usize) & keep;
+            n += ((set[h >> 6] >> (h & 63)) & 1) as u32;
+        }
+        n >= need
     }
 
     /// Clean (non-typo) score; `None` if the token is not a subsequence.
@@ -221,8 +316,16 @@ impl Pattern {
     /// the search engine).
     #[inline]
     pub fn score_sig(&self, name: &[u8], orig: &[u8], name_bigrams: Sig) -> Option<i32> {
-        let clean = self.clean_score(name, orig);
-        if clean.is_some_and(|c| c >= TYPO1 + 30) || name.len() + (self.typos as usize) < self.text.len() || !self.typo_candidate(name_bigrams) {
+        self.score_masked(name, orig, name_bigrams, !0)
+    }
+
+    /// `score_sig` given the name's class mask `m` (or any superset, `!0`
+    /// when unknown): a clean match needs every class of the token, so the
+    /// subsequence scan only runs when they are all present.
+    #[inline]
+    pub fn score_masked(&self, name: &[u8], orig: &[u8], name_bigrams: Sig, m: u64) -> Option<i32> {
+        let clean = if self.mask & !m == 0 { self.clean_score(name, orig) } else { None };
+        if clean.is_some_and(|c| c >= TYPO1 + 30) || name.len() + (self.typos as usize) < self.text.len() || !self.typo_candidate_in(name, name_bigrams) {
             return clean;
         }
         match self.typo(name) {
@@ -397,6 +500,61 @@ pub fn osa_distance(peq: &[u64; 256], m: usize, text: &[u8], anchored: bool) -> 
 
 #[cfg(test)]
 mod tests {
+    /// The q-gram, verbatim-piece and signature prefilters must never reject
+    /// a name the (unfiltered) OSA typo path accepts.
+    #[test]
+    fn typo_prefilters_are_lossless() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let alpha = b"abcdeilmnorstu_.-0123";
+        let (mut checked, mut accepted) = (0, 0);
+        for _ in 0..40_000 {
+            let m = 5 + rnd(26) as usize;
+            let tok: Vec<u8> = (0..m).map(|_| alpha[rnd(alpha.len() as u64) as usize]).collect();
+            let pat = Pattern::new(&tok, true);
+            let mut w = tok.clone();
+            for _ in 0..1 + rnd(pat.typos.max(1) as u64) {
+                let p = rnd(w.len() as u64) as usize;
+                match rnd(4) {
+                    0 => w[p] = alpha[rnd(alpha.len() as u64) as usize],
+                    1 => w.insert(p, alpha[rnd(alpha.len() as u64) as usize]),
+                    2 if w.len() > 1 => {
+                        w.remove(p);
+                    }
+                    _ if p + 1 < w.len() => w.swap(p, p + 1),
+                    _ => {}
+                }
+            }
+            let mut name: Vec<u8> = (0..rnd(12)).map(|_| alpha[rnd(alpha.len() as u64) as usize]).collect();
+            name.extend(&w);
+            name.extend((0..rnd(12)).map(|_| alpha[rnd(alpha.len() as u64) as usize]));
+            checked += 1;
+            if pat.typo(&name).is_some() {
+                accepted += 1;
+                assert!(pat.typo_candidate_in(&name, bigram_sig(&name)), "rejected {:?} for {:?}", String::from_utf8_lossy(&name), String::from_utf8_lossy(&tok));
+                assert!(pat.score_masked(&name, &name, bigram_sig(&name), class_mask(&name)).is_some());
+            }
+        }
+        assert!(accepted > checked / 4, "{accepted}/{checked}");
+    }
+
+    #[test]
+    fn may_match_equals_popcount() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..100_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let (need, m) = (x.rotate_left(17) & x, x.rotate_left(31) | x >> 3);
+            for k in 0..4u8 {
+                assert_eq!(may_match(need, k, m), (need & !m).count_ones() <= k as u32);
+            }
+        }
+    }
+
     use super::*;
 
     /// Reference OSA distance (pattern vs. best substring/prefix of text).

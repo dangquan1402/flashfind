@@ -393,6 +393,21 @@ fn main() {
         }
     }
     let keys: Vec<&String> = targets.iter().take(a.num("--keys", 40)).collect();
+    if let Some(p) = a.get("--dump-queries") {
+        let mut o = String::new();
+        for q in qs.iter().chain(repo_qs.iter()) {
+            o += &format!("{}\t{}\t{}\n", q.class, q.q, q.target);
+        }
+        for t in &keys {
+            let name: Vec<char> = base(t).chars().collect();
+            for n in 1..=name.len() {
+                o += &format!("keys\t{}\t{}\n", name[..n].iter().collect::<String>(), t);
+            }
+        }
+        std::fs::write(p, o).unwrap();
+        cx.t.finish();
+        return;
+    }
 
     // 3. Cold build + memory per engine, each in its own child process.
     let exe = std::env::current_exe().unwrap();

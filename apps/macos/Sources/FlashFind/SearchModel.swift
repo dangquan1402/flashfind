@@ -339,7 +339,8 @@ final class SearchModel: ObservableObject {
     func copy(_ kind: CopyKind) {
         let t = targets
         guard !t.isEmpty else { return }
-        let rel = { (h: Hit) in mode == .code && !h.rel.isEmpty ? h.rel : abbreviate(h.path) }
+        let code = mode == .code
+        let rel = { (h: Hit) in code && !h.rel.isEmpty ? h.rel : abbreviate(h.path) }
         let text: String
         switch kind {
         case .absolute: text = t.map(\.path).joined(separator: "\n")

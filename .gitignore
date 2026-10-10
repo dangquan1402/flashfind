@@ -5,3 +5,4 @@
 /dist/
 apps/macos/.build/
 /bench/vs/target
+__pycache__/

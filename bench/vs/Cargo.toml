@@ -1,0 +1,34 @@
+[package]
+name = "flashfind-vs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Terminal benchmark: flashfind vs fff vs fsearch, in one process, same dataset and queries"
+
+# Not part of the main workspace: it pulls in fff (git2, LMDB) and an
+# upstream fsearch checkout. Build with bench/vs.sh.
+[workspace]
+
+[[bin]]
+name = "flashfind-vs"
+path = "src/main.rs"
+
+[dependencies]
+flashfind-core = { path = "../../crates/flashfind-core" }
+flashfind-code = { path = "../../crates/flashfind-code" }
+# fff's Rust core (the crate its Python/Lua/C bindings wrap), pinned.
+fff-search = { git = "https://github.com/dmtrKovalenko/fff", rev = "65119f965d39a657020daf9198a657f6d1f718fd" }
+ignore = "0.4"
+serde_json = "1"
+libc = "0.2"
+
+# fsearch is macOS-only; expected next to this repo (../fsearch, i.e.
+# ~/dev/fsearch when the repo is ~/dev/flashfind).
+[target.'cfg(target_os = "macos")'.dependencies]
+fsearch = { path = "../../../fsearch" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

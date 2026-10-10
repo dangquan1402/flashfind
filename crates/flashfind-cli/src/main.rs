@@ -22,6 +22,7 @@ USAGE (code projects):
   flashfind gen-repos --root DIR --repos N [--seed S] --queries FILE
   flashfind bench-code --root DIR --queries FILE [--out JSON --md MD]
   flashfind bench-live-code --dir DIR-IN-A-REPO [-n N]   change-to-searchable latency (temp files, cleaned up)
+  flashfind bench-vs --root DIR [--label NAME] ...       live terminal race vs fff and fsearch (bench/vs, built separately)
   Roots default to $FLASHFIND_CODE_ROOTS or ~ (Library, media and hidden folders skipped);
   the code index is cached in $FLASHFIND_CACHE or ~/.cache/flashfind and follows changes live
   (FSEvents on macOS; elsewhere rebuilt when older than --max-age, default 600 s).
@@ -125,6 +126,7 @@ fn main() {
         "gen-repos" => code::cmd_gen_repos(a),
         "bench-code" => code::cmd_bench_code(a),
         "bench-live-code" => code::cmd_bench_live_code(a),
+        "bench-vs" => bench_vs(),
         "report" => report::run(a),
         "help" | "-h" | "--help" => {
             if a.rest().first().map(String::as_str) == Some("query") {
@@ -300,4 +302,23 @@ fn cmd_search(mut a: Args) {
         if r.total_exact { "" } else { "+" },
         r.strategy
     );
+}
+
+/// `flashfind bench-vs ...`: forwards to the `flashfind-vs` harness (bench/vs),
+/// which links fff and fsearch and so is built separately (bench/vs.sh).
+fn bench_vs() {
+    let exe = std::env::current_exe().ok();
+    let mut cands: Vec<std::path::PathBuf> = std::env::var_os("FLASHFIND_VS").map(Into::into).into_iter().collect();
+    if let Some(dir) = exe.as_ref().and_then(|e| e.parent()) {
+        cands.push(dir.join("flashfind-vs"));
+        // target/release/flashfind -> bench/vs/target/release/flashfind-vs
+        cands.push(dir.join("../../bench/vs/target/release/flashfind-vs"));
+    }
+    let Some(bin) = cands.into_iter().find(|p| p.is_file()) else {
+        eprintln!("flashfind bench-vs needs the harness: run bench/vs.sh once (builds bench/vs with fff + fsearch), or set FLASHFIND_VS");
+        std::process::exit(2);
+    };
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let st = std::process::Command::new(bin).args(&args).status().unwrap_or_else(|e| die(e));
+    std::process::exit(st.code().unwrap_or(1));
 }

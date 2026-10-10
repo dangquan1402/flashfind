@@ -4,3 +4,4 @@
 *.ffx
 /dist/
 apps/macos/.build/
+/bench/vs/target

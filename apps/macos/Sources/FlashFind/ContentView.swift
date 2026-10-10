@@ -45,10 +45,11 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             HStack(spacing: 12) {
-                Text(model.status).monospacedDigit().lineLimit(1)
+                Text(model.status).monospacedDigit().lineLimit(1).truncationMode(.tail).layoutPriority(1)
                 Spacer(minLength: 8)
-                Text("↩ open  ⌘↩ reveal  ⌥↩ Cursor  ␣ after ↑↓ / ⌘Y Quick Look  ⌘C copy path")
+                Text("↩ open · ⌘↩ reveal · ⌥↩ Cursor · ⌘Y preview · ⌘C copy")
                     .lineLimit(1)
+                    .help("Space also previews after moving with ↑/↓. Esc clears, then hides. ⌘1/⌘2 switch mode. ⌃⌥Space toggles from anywhere.")
             }
             .font(.system(size: 11))
             .foregroundStyle(.secondary)

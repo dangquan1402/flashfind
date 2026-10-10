@@ -73,6 +73,7 @@ final class SearchModel: ObservableObject {
     private var current: OpaquePointer?
     private var seq = 0
     private var idle = ""
+    private var brief = ""
     private var flashUntil = Date.distantPast
 
     init(opts: LaunchOptions) {
@@ -101,6 +102,7 @@ final class SearchModel: ObservableObject {
                     let s = c.stats()
                     let live = watchErr == nil ? "live" : "not watching"
                     self.idle = "\(s.repos) projects · \(s.entries.formatted()) files · opened in \(Int(ms)) ms · \(live)"
+                    self.brief = "\(s.repos) projects · \(live)"
                     self.status = self.idle
                 } else {
                     self.status = "Could not open projects: \(err ?? "unknown error")"
@@ -180,7 +182,7 @@ final class SearchModel: ObservableObject {
         let engine = Double(r.engineMicros) / 1000
         let shown = r.total > UInt64(r.hits.count) ? "\(r.hits.count) of \(r.total.formatted())" : "\(r.hits.count)"
         if Date() > flashUntil {
-            status = String(format: "%.2f ms engine · %.1f ms keystroke→results · ", engine, screenMs) + "\(shown) matches · " + idle
+            status = String(format: "%.2f ms engine · %.1f ms keystroke→results · ", engine, screenMs) + "\(shown) matches · " + (mode == .code ? brief : "whole disk")
         }
         onResults?()
     }
